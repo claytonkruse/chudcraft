@@ -36,8 +36,9 @@ draw_chunk :: proc(chunk: ^Chunk) {
 				if block == .Air {
 					continue
 				}
-				// Each block is a 1-unit cube centered on its grid coordinate.
-				pos := [3]f32{f32(x), f32(y), f32(z)}
+				// The block's position is the center of its bottom face.
+				// DrawCube uses the cube's center, half a block above that.
+				pos := [3]f32{f32(x), f32(y) + 0.5, f32(z)}
 				rl.DrawCube(pos, 1, 1, 1, block_color(block))
 				rl.DrawCubeWires(pos, 1, 1, 1, rl.BLACK)
 			}
@@ -45,9 +46,14 @@ draw_chunk :: proc(chunk: ^Chunk) {
 	}
 }
 
-// A block at integer coordinate i fills [i - 0.5, i + 0.5].
-block_index :: proc(v: f32) -> int {
+// Horizontally, block i covers [i - 0.5, i + 0.5].
+block_index_horizontal :: proc(v: f32) -> int {
 	return int(math.floor(v + 0.5))
+}
+
+// Vertically, block i covers [i, i + 1], with its bottom on i.
+block_index_vertical :: proc(v: f32) -> int {
+	return int(math.floor(v))
 }
 
 solid :: proc(chunk: ^Chunk, x, y, z: int) -> bool {

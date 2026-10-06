@@ -11,8 +11,8 @@ WALK_SPEED        :: 4.5
 GRAVITY           :: 32.0
 JUMP_SPEED        :: 9.0
 
-// Feet position. The grass layer is centered on y = 3, so its top is 3.5.
-SPAWN_POSITION :: [3]f32{8, 3.5, 2}
+// Feet on the middle of the grass block at (8, 3, 2). Its top is y = 4.
+SPAWN_POSITION :: [3]f32{0, 9, 0}
 
 Player :: struct {
 	position: [3]f32,
@@ -51,7 +51,8 @@ update_player :: proc(player: ^Player, chunk: ^Chunk, dt: f32) {
 	}
 
 	falling := player.velocity.y < 0
-	player.grounded = falling && move_player(player, chunk, 1, player.velocity.y * dt)
+	hit := move_player(player, chunk, 1, player.velocity.y * dt)
+	player.grounded = falling && hit
 	move_player(player, chunk, 0, player.velocity.x * dt)
 	move_player(player, chunk, 2, player.velocity.z * dt)
 
@@ -76,9 +77,9 @@ move_player :: proc(player: ^Player, chunk: ^Chunk, axis: int, delta: f32) -> bo
 	for _ in 0 ..< 8 {
 		min, max := player_bounds(player.position)
 		blocked := false
-		x0, x1 := block_index(min.x), block_index(max.x - 0.001)
-		y0, y1 := block_index(min.y), block_index(max.y - 0.001)
-		z0, z1 := block_index(min.z), block_index(max.z - 0.001)
+		x0, x1 := block_index_horizontal(min.x), block_index_horizontal(max.x - 0.001)
+		y0, y1 := block_index_vertical(min.y), block_index_vertical(max.y - 0.001)
+		z0, z1 := block_index_horizontal(min.z), block_index_horizontal(max.z - 0.001)
 
 		for x := x0; x <= x1; x += 1 {
 			for y := y0; y <= y1; y += 1 {
@@ -86,8 +87,8 @@ move_player :: proc(player: ^Player, chunk: ^Chunk, axis: int, delta: f32) -> bo
 					if !solid(chunk, x, y, z) {
 						continue
 					}
-					bmin := [3]f32{f32(x), f32(y), f32(z)} - 0.5
-					bmax := bmin + 1
+					bmin := [3]f32{f32(x) - 0.5, f32(y), f32(z) - 0.5}
+					bmax := [3]f32{f32(x) + 0.5, f32(y) + 1, f32(z) + 0.5}
 					if separated(min, max, bmin, bmax, axis) {
 						continue
 					}
