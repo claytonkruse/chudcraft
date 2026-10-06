@@ -16,6 +16,8 @@ main :: proc() {
 
 	chunk: Chunk
 	fill_chunk(&chunk)
+	textures := load_block_textures()
+	defer unload_block_textures(textures)
 
 	// Stand on the grass, looking across the chunk (+Z).
 	player := Player {
@@ -30,6 +32,12 @@ main :: proc() {
 		dt := min(rl.GetFrameTime(), 0.05)
 		update_player(&player, &chunk, dt)
 		camera := camera_from_player(player)
+		look := camera.target - camera.position
+		hit, bx, by, bz := raycast_block(&chunk, camera.position, look, MINE_REACH)
+		if hit && rl.IsMouseButtonPressed(.LEFT) {
+			chunk[bx][by][bz] = .Air
+			hit = false
+		}
 
 		// Start a new frame.
 		rl.BeginDrawing()
@@ -38,7 +46,10 @@ main :: proc() {
 
 		// Draw 3D geometry using this camera.
 		rl.BeginMode3D(camera)
-		draw_chunk(&chunk)
+		draw_chunk(&chunk, textures)
+		if hit {
+			draw_block_highlight(bx, by, bz, camera.position)
+		}
 		// Finish 3D drawing.
 		rl.EndMode3D()
 
