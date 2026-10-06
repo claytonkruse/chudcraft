@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import rl "vendor:raylib"
+import "vendor:raylib/rlgl"
 
 main :: proc() {
 	rl.SetConfigFlags({.MSAA_4X_HINT}) // enable antialiasing
@@ -41,6 +42,7 @@ main :: proc() {
 		// Finish 3D drawing.
 		rl.EndMode3D()
 
+		draw_crosshair()
 		draw_fps(hud_font, 8, 8)
 		draw_player_position(hud_font, player)
 
@@ -51,6 +53,30 @@ main :: proc() {
 
 HUD_SIZE :: f32(20)
 HUD_SPACING :: f32(0)
+
+// White pixels blended as (1 - destination) invert whatever is behind the crosshair.
+draw_crosshair :: proc() {
+	rlgl.SetBlendFactorsSeparate(
+		rlgl.ONE_MINUS_DST_COLOR, rlgl.ZERO,
+		rlgl.ZERO, rlgl.ONE,
+		rlgl.FUNC_ADD, rlgl.FUNC_ADD,
+	)
+	rl.BeginBlendMode(.CUSTOM_SEPARATE)
+
+	center_x := rl.GetScreenWidth() / 2
+	center_y := rl.GetScreenHeight() / 2
+	// A positive gap splits the arms and leaves the center pixel unchanged.
+	gap: c.int = 0
+	arm: c.int = 8
+	thick: c.int = 2
+
+	rl.DrawRectangle(center_x - gap - arm, center_y - thick / 2, arm, thick, rl.WHITE)
+	rl.DrawRectangle(center_x + gap, center_y - thick / 2, arm, thick, rl.WHITE)
+	rl.DrawRectangle(center_x - thick / 2, center_y - gap - arm, thick, arm, rl.WHITE)
+	rl.DrawRectangle(center_x - thick / 2, center_y + gap, thick, arm, rl.WHITE)
+
+	rl.EndBlendMode()
+}
 
 // One shifted copy. Drawing a black glyph on every side fills the letter in.
 draw_hud_text :: proc(font: rl.Font, text: cstring, x, y: c.int, color: rl.Color) {
