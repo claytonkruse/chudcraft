@@ -1,176 +1,197 @@
 package main
 
 import "core:math"
-import rl "vendor:raylib"
-import "vendor:raylib/rlgl"
 
+// Air has to stay the zero value, because that is what an absent chunk reads as.
 Block :: enum u8 {
 	Air,
 	Grass,
 	Dirt,
 	Stone,
+	Bedrock,
+	Coal_Ore,
+	Iron_Ore,
+	Gold_Ore,
+	Water,
+	Oak_Log,
+	Oak_Leaves,
 }
 
-WIDTH  :: 16
-HEIGHT :: 16
-DEPTH  :: 16
+// A power of two, so splitting a world coordinate is a shift and a mask.
+CHUNK_SIZE  :: 16
+CHUNK_SHIFT :: 4
+CHUNK_MASK  :: CHUNK_SIZE - 1
 
 // How far, in meters, a look ray can break a block.
 MINE_REACH :: 5.0
 
-// Plains grass color. The Faithful grass top is grayscale and gets multiplied by this.
-GRASS_TINT :: [4]u8{145, 189, 89, 255}
+// How far up and down a column is searched for ground.
+SURFACE_SCAN :: 256
 
-// Placeholder art from Faithful 32x. Replace these before distributing the game.
-// https://faithfulpack.net
-Block_Textures :: struct {
-	grass_top:  rl.Texture2D,
-	grass_side: rl.Texture2D,
-	dirt:       rl.Texture2D,
-	stone:      rl.Texture2D,
+Chunk :: struct {
+	blocks: [CHUNK_SIZE][CHUNK_SIZE][CHUNK_SIZE]Block,
+	// Set when a block here changed, so this chunk's mesh gets rebuilt.
+	dirty:  bool,
+	// Dirt waiting to become grass, and leaves waiting to decay, soonest first.
+	// A check stops at the first date that is not due. Absent while the chunk is
+	// unloaded; the date is what lets the change happen anyway.
+	pending: [dynamic]Deadline,
 }
 
-Chunk :: [WIDTH][HEIGHT][DEPTH]Block
+// Chunks exist only where blocks do, which is what leaves the world without a build
+// height limit: a coordinate with no chunk reads as air and costs nothing.
+// Chunks are allocated on their own because the mesher holds onto them across frames,
+// and growing the map would move values stored inline.
+World :: struct {
+	chunks: map[[3]int]^Chunk,
+	// Seconds since this world started. Deadlines are measured on this clock.
+	time: f64,
+	// Block edits recorded for clients. Generation leaves this off, then the
+	// server turns it on so only play is replicated.
+	record:  bool,
+	changes: [dynamic]Block_Change,
+}
 
-// Air is the zero value, so only the ground layers need to be filled.
-fill_chunk :: proc(chunk: ^Chunk) {
-	for x in 0 ..< WIDTH {
-		for z in 0 ..< DEPTH {
-			chunk[x][0][z] = .Stone
-			chunk[x][1][z] = .Stone
-			chunk[x][2][z] = .Dirt
-			chunk[x][3][z] = .Grass
+// One cell a client should copy. The server is the only place a block changes.
+Block_Change :: struct {
+	x, y, z: int,
+	block:   Block,
+}
+
+world_destroy :: proc(world: ^World) {
+	for _, chunk in world.chunks {
+		delete(chunk.pending)
+		free(chunk)
+	}
+	delete(world.chunks)
+	delete(world.changes)
+}
+
+// A shift floors toward negative infinity. Odin's `/` truncates toward zero, which
+// would fold the chunks just below the origin onto the ones just above it.
+chunk_of :: proc(x, y, z: int) -> [3]int {
+	return {x >> CHUNK_SHIFT, y >> CHUNK_SHIFT, z >> CHUNK_SHIFT}
+}
+
+// The matching non-negative remainder, for the same reason.
+local_of :: proc(x, y, z: int) -> [3]int {
+	return {x & CHUNK_MASK, y & CHUNK_MASK, z & CHUNK_MASK}
+}
+
+get_block :: proc(world: ^World, x, y, z: int) -> Block {
+	chunk := world.chunks[chunk_of(x, y, z)]
+	if chunk == nil {
+		return .Air
+	}
+	l := local_of(x, y, z)
+	return chunk.blocks[l.x][l.y][l.z]
+}
+
+set_block :: proc(world: ^World, x, y, z: int, block: Block) {
+	set_block_at(world, x, y, z, block, world.time)
+}
+
+// at is when the block took this form. A deadline fired late passes its own time,
+// so the dirt beside the new grass is dated from then and can already be due.
+set_block_at :: proc(world: ^World, x, y, z: int, block: Block, at: f64) {
+	old, wrote := store_block(world, x, y, z, block)
+	if !wrote {
+		return
+	}
+	reschedule(world, x, y, z, at)
+	// Opening or closing the block above is what makes the dirt underneath
+	// eligible for grass, or takes that eligibility away.
+	if get_block(world, x, y-1, z) == .Dirt {
+		reschedule(world, x, y-1, z, at)
+	}
+	// Leaves remember whether they can reach a log. A new one can complete a
+	// path that an earlier leaf could not see yet, and removing one can break it.
+	leaves_after_change(world, x, y, z, old, block, at)
+}
+
+// Writes one cell and marks the meshes that show it. No growth scheduling: the
+// server does that itself, and a client copy only wants the new block.
+store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, wrote: bool) {
+	key := chunk_of(x, y, z)
+	chunk := world.chunks[key]
+	if chunk == nil {
+		// Already air, and an empty chunk is not worth allocating.
+		if block == .Air {
+			return .Air, false
+		}
+		chunk = new(Chunk)
+		world.chunks[key] = chunk
+	}
+
+	l := local_of(x, y, z)
+	old = chunk.blocks[l.x][l.y][l.z]
+	if old == block {
+		return old, false
+	}
+	chunk.blocks[l.x][l.y][l.z] = block
+	chunk.dirty = true
+
+	// A block on a border decides which faces the chunk across that border draws,
+	// so that chunk has to be rebuilt too.
+	for axis in 0 ..< 3 {
+		if l[axis] != 0 && l[axis] != CHUNK_MASK {
+			continue
+		}
+		neighbor := key
+		neighbor[axis] += -1 if l[axis] == 0 else 1
+		if adjacent, ok := world.chunks[neighbor]; ok {
+			adjacent.dirty = true
 		}
 	}
+	if world.record {
+		append(&world.changes, Block_Change{x = x, y = y, z = z, block = block})
+	}
+	return old, true
 }
 
-draw_chunk :: proc(chunk: ^Chunk, textures: Block_Textures) {
-	for x in 0 ..< WIDTH {
-		for y in 0 ..< HEIGHT {
-			for z in 0 ..< DEPTH {
-				block := chunk[x][y][z]
-				if block == .Air {
-					continue
-				}
-				// The block's position is the center of its bottom face.
-				// The cube is drawn around a center half a block above that.
-				pos := [3]f32{f32(x), f32(y) + 0.5, f32(z)}
-				draw_block(pos, block, textures)
-				// rl.DrawCubeWires(pos, 1, 1, 1, rl.BLACK)
-			}
+// Whether a block stops the player, which is also what the break ray stops on.
+solid :: proc(world: ^World, x, y, z: int) -> bool {
+	return block_solid(get_block(world, x, y, z))
+}
+
+// Hides the face of whatever is next to it, so the mesher can skip that face.
+block_opaque :: proc(block: Block) -> bool {
+	#partial switch block {
+	case .Air, .Water, .Oak_Leaves:
+		return false
+	}
+	return true
+}
+
+// Stops the player. Water does not, which also means the break ray passes straight
+// through it rather than letting water be mined.
+block_solid :: proc(block: Block) -> bool {
+	return block != .Air && block != .Water
+}
+
+// Bedrock is the floor of the world, so it has to stay put.
+breakable :: proc(block: Block) -> bool {
+	return block != .Air && block != .Bedrock
+}
+
+// The Y a player stands at on this column. Y is bottom-aligned, so the block at y
+// has its top face at y + 1.
+surface_height :: proc(world: ^World, x, z: int) -> int {
+	for y := SURFACE_SCAN; y >= -SURFACE_SCAN; y -= 1 {
+		if solid(world, x, y, z) {
+			return y + 1
 		}
 	}
-	rlgl.SetTexture(0)
+	return 0
 }
 
-load_block_textures :: proc() -> Block_Textures {
-	textures := Block_Textures {
-		grass_top  = rl.LoadTexture("assets/textures/grass_block_top.png"),
-		grass_side = rl.LoadTexture("assets/textures/grass_block_side.png"),
-		dirt       = rl.LoadTexture("assets/textures/dirt.png"),
-		stone      = rl.LoadTexture("assets/textures/stone.png"),
-	}
-	prepare_texture(textures.grass_top)
-	prepare_texture(textures.grass_side)
-	prepare_texture(textures.dirt)
-	prepare_texture(textures.stone)
-	return textures
-}
-
-unload_block_textures :: proc(textures: Block_Textures) {
-	unload_texture(textures.grass_top)
-	unload_texture(textures.grass_side)
-	unload_texture(textures.dirt)
-	unload_texture(textures.stone)
-}
-
-prepare_texture :: proc(texture: rl.Texture2D) {
-	if texture.id == 0 {
-		return
-	}
-	rl.SetTextureFilter(texture, .POINT)
-	rl.SetTextureWrap(texture, .CLAMP)
-}
-
-unload_texture :: proc(texture: rl.Texture2D) {
-	if texture.id != 0 {
-		rl.UnloadTexture(texture)
-	}
-}
-
-draw_block :: proc(center: [3]f32, block: Block, textures: Block_Textures) {
-	if textures.stone.id == 0 {
-		rl.DrawCube(center, 1, 1, 1, block_color(block))
-		return
-	}
-
-	top := textures.stone
-	side := textures.stone
-	bottom := textures.stone
-	top_tint := [4]u8{255, 255, 255, 255}
-	switch block {
-	case .Grass:
-		top = textures.grass_top
-		side = textures.grass_side
-		bottom = textures.dirt
-		top_tint = GRASS_TINT
-	case .Dirt:
-		top = textures.dirt
-		side = textures.dirt
-		bottom = textures.dirt
-	case .Stone:
-		top = textures.stone
-		side = textures.stone
-		bottom = textures.stone
-	case .Air:
-		return
-	}
-
-	x0 := center.x - 0.5
-	x1 := center.x + 0.5
-	y0 := center.y - 0.5
-	y1 := center.y + 0.5
-	z0 := center.z - 0.5
-	z1 := center.z + 0.5
-	white := [4]u8{255, 255, 255, 255}
-
-	rlgl.SetTexture(side.id)
-	rlgl.Begin(rlgl.QUADS)
-	draw_quad({x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}, white)
-	draw_quad({x1, y0, z0}, {x0, y0, z0}, {x0, y1, z0}, {x1, y1, z0}, white)
-	draw_quad({x1, y0, z1}, {x1, y0, z0}, {x1, y1, z0}, {x1, y1, z1}, white)
-	draw_quad({x0, y0, z0}, {x0, y0, z1}, {x0, y1, z1}, {x0, y1, z0}, white)
-	rlgl.End()
-
-	rlgl.SetTexture(top.id)
-	rlgl.Begin(rlgl.QUADS)
-	draw_quad({x0, y1, z1}, {x1, y1, z1}, {x1, y1, z0}, {x0, y1, z0}, top_tint)
-	rlgl.End()
-
-	rlgl.SetTexture(bottom.id)
-	rlgl.Begin(rlgl.QUADS)
-	draw_quad({x0, y0, z0}, {x1, y0, z0}, {x1, y0, z1}, {x0, y0, z1}, white)
-	rlgl.End()
-}
-
-draw_quad :: proc(a, b, c, d: [3]f32, tint: [4]u8) {
-	rlgl.Color4ub(tint[0], tint[1], tint[2], tint[3])
-	rlgl.TexCoord2f(0, 1)
-	rlgl.Vertex3f(a.x, a.y, a.z)
-	rlgl.TexCoord2f(1, 1)
-	rlgl.Vertex3f(b.x, b.y, b.z)
-	rlgl.TexCoord2f(1, 0)
-	rlgl.Vertex3f(c.x, c.y, c.z)
-	rlgl.TexCoord2f(0, 0)
-	rlgl.Vertex3f(d.x, d.y, d.z)
-}
-
-// First solid block the ray enters, within reach. Direction does not need to be normalized.
+// First solid block the ray enters, within reach, and the cell it was entered from.
+// That cell is where a placed block goes. Direction does not need to be normalized.
 // X and Z are shifted by 0.5 so every block is a unit cell and a grid walk can cross them.
-raycast_block :: proc(chunk: ^Chunk, origin, direction: [3]f32, reach: f32) -> (hit: bool, x, y, z: int) {
+raycast_block :: proc(world: ^World, origin, direction: [3]f32, reach: f32) -> (hit: bool, x, y, z, px, py, pz: int) {
 	length := math.sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
 	if length == 0 {
-		return false, 0, 0, 0
+		return false, 0, 0, 0, 0, 0, 0
 	}
 	dir := direction / length
 	pos := [3]f32{origin.x + 0.5, origin.y, origin.z + 0.5}
@@ -197,13 +218,16 @@ raycast_block :: proc(chunk: ^Chunk, origin, direction: [3]f32, reach: f32) -> (
 	}
 
 	cell := [3]int{x, y, z}
+	// The cell the ray is leaving. A hit on the first cell leaves this equal to
+	// the hit, and placement then sees a block that is already there.
+	prev := cell
 	distance: f32 = 0
 	for _ in 0 ..< 64 {
 		if distance > reach {
 			break
 		}
-		if solid(chunk, cell.x, cell.y, cell.z) {
-			return true, cell.x, cell.y, cell.z
+		if solid(world, cell.x, cell.y, cell.z) {
+			return true, cell.x, cell.y, cell.z, prev.x, prev.y, prev.z
 		}
 
 		axis := 0
@@ -212,25 +236,12 @@ raycast_block :: proc(chunk: ^Chunk, origin, direction: [3]f32, reach: f32) -> (
 		if step[axis] == 0 {
 			break
 		}
+		prev = cell
 		cell[axis] += int(step[axis])
 		distance = t_max[axis]
 		t_max[axis] += t_delta[axis]
 	}
-	return false, 0, 0, 0
-}
-
-
-// Far enough in front of the block face that the wires win the depth test, close enough to still read as the block edge.
-HIGHLIGHT_BIAS :: 0.005
-
-draw_block_highlight :: proc(x, y, z: int, eye: [3]f32) {
-	center := [3]f32{f32(x), f32(y) + 0.5, f32(z)}
-	to_eye := eye - center
-	length := math.sqrt(to_eye.x*to_eye.x + to_eye.y*to_eye.y + to_eye.z*to_eye.z)
-	if length > 0 {
-		center += to_eye * (HIGHLIGHT_BIAS / length)
-	}
-	rl.DrawCubeWires(center, 1, 1, 1, rl.BLACK)
+	return false, 0, 0, 0, 0, 0, 0
 }
 
 // Horizontally, block i covers [i - 0.5, i + 0.5].
@@ -241,25 +252,4 @@ block_index_horizontal :: proc(v: f32) -> int {
 // Vertically, block i covers [i, i + 1], with its bottom on i.
 block_index_vertical :: proc(v: f32) -> int {
 	return int(math.floor(v))
-}
-
-solid :: proc(chunk: ^Chunk, x, y, z: int) -> bool {
-	if x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT || z < 0 || z >= DEPTH {
-		return false
-	}
-	return chunk[x][y][z] != .Air
-}
-
-block_color :: proc(block: Block) -> rl.Color {
-	switch block {
-	case .Grass:
-		return rl.GREEN
-	case .Dirt:
-		return rl.BROWN
-	case .Stone:
-		return rl.GRAY
-	case .Air:
-		return rl.BLANK
-	}
-	return rl.BLANK
 }
