@@ -90,7 +90,7 @@ main :: proc() {
 
 		frame_dt := f64(rl.GetFrameTime())
 		dt := min(f32(frame_dt), 0.05)
-		input := client_read_input(client.player, playing, client.inventory.open, dt)
+		input := client_read_input(client.player, playing, client.inventory.open, client.inventory.selected, dt)
 		if want_close {
 			input.action = .Stow
 		}
@@ -116,6 +116,8 @@ main :: proc() {
 		// are not blended across frames.
 		taa_begin(&taa, &msaa, camera, options.taa, options.msaa)
 		draw_world(&renderer, &client.world)
+		draw_drops(&renderer, client.drops[:])
+		draw_remote_players(&renderer, client.others[:])
 		if playing && hit {
 			draw_block_highlight(bx, by, bz, camera.position)
 		}

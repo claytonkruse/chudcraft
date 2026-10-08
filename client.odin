@@ -12,6 +12,7 @@ Client :: struct {
 	inventory: Inventory,
 	seed:      i64,
 	others:    [dynamic]Remote_View,
+	drops:     [dynamic]Drop_View,
 }
 
 client_connect :: proc(client: ^Client, server: ^Server) {
@@ -31,6 +32,7 @@ client_destroy :: proc(client: ^Client) {
 		server_leave(client.server, client.id)
 	}
 	delete(client.others)
+	delete(client.drops)
 	world_destroy(&client.world)
 	client.server = nil
 	client.id = 0
@@ -54,6 +56,16 @@ client_pull :: proc(client: ^Client) {
 	for change in client.server.world.changes {
 		store_block(&client.world, change.x, change.y, change.z, change.block)
 	}
+	clear(&client.drops)
+	for drop in client.server.drops {
+		append(&client.drops, Drop_View{
+			block    = drop.block,
+			count    = drop.count,
+			position = drop.position,
+			age      = drop.age,
+			phase    = drop.phase,
+		})
+	}
 	clear(&client.others)
 	for id, other in client.server.players {
 		if id == client.id {
@@ -69,7 +81,7 @@ client_pull :: proc(client: ^Client) {
 }
 
 // Keys and mouse become a message. Nothing here changes the world.
-client_read_input :: proc(player: Player, playing, inventory_open: bool, move_dt: f32) -> Client_Input {
+client_read_input :: proc(player: Player, playing, inventory_open: bool, selected: int, move_dt: f32) -> Client_Input {
 	input := Client_Input{
 		move = {
 			dt = move_dt,
@@ -98,16 +110,37 @@ client_read_input :: proc(player: Player, playing, inventory_open: bool, move_dt
 				input.slot = i
 			}
 		}
+		// One from the selected hotbar slot, thrown along the look.
+		if rl.IsKeyPressed(.Q) {
+			input.action = .Drop
+			input.slot = selected
+		}
 		return input
 	}
 	if inventory_open {
+		// The slot under the cursor, or the stack on it when the cursor is elsewhere.
+		if rl.IsKeyPressed(.Q) {
+			input.action = .Drop
+			if index, ok := inventory_slot_at(rl.GetMousePosition()); ok {
+				input.slot = index
+			} else {
+				input.slot = -1
+			}
+			return input
+		}
 		left := rl.IsMouseButtonPressed(.LEFT)
 		right := rl.IsMouseButtonPressed(.RIGHT)
 		if left || right {
-			index, ok := inventory_slot_at(rl.GetMousePosition())
+			mouse := rl.GetMousePosition()
+			index, ok := inventory_slot_at(mouse)
 			if ok {
 				input.action = .Click_Right if right && !left else .Click_Left
 				input.slot = index
+			} else if !rl.CheckCollisionPointRec(mouse, inventory_layout(true).panel) {
+				// Past the panel edge, the stack on the cursor leaves the inventory.
+				// Left sends the whole stack, right sends one.
+				input.action = .Drop_All if left else .Drop
+				input.slot = -1
 			}
 		}
 	}

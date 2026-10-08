@@ -131,6 +131,9 @@ Renderer :: struct {
 	// One picture per block, drawn in the hotbar and the inventory. Baked once;
 	// a slot redraws the picture, not the mesh.
 	icons:     [Block]rl.RenderTexture2D,
+	// The cube those pictures were drawn from, kept so a drop can spin in the world.
+	item_meshes: [Block]Chunk_Mesh,
+	player:    Player_Model,
 }
 
 renderer_init :: proc() -> Renderer {
@@ -150,6 +153,7 @@ renderer_init :: proc() -> Renderer {
 		renderer.materials[surface] = material
 	}
 	build_block_icons(&renderer)
+	player_model_init(&renderer)
 	return renderer
 }
 
@@ -163,6 +167,9 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 		free(mesh)
 	}
 	delete(renderer.meshes)
+	for block in Block {
+		unload_chunk_mesh(&renderer.item_meshes[block])
+	}
 
 	for surface in Surface {
 		// UnloadMaterial frees any shader that is not raylib's default, which would
@@ -190,6 +197,7 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 			rl.UnloadRenderTexture(renderer.icons[block])
 		}
 	}
+	player_model_destroy(&renderer.player)
 }
 
 // Rebuilds whatever is dirty, then draws every chunk mesh once.
@@ -360,19 +368,56 @@ build_block_icons :: proc(renderer: ^Renderer) {
 		if block == .Air {
 			continue
 		}
-		mesh: Chunk_Mesh
-		build_icon_mesh(renderer, block, &mesh)
+		mesh := &renderer.item_meshes[block]
+		build_icon_mesh(renderer, block, mesh)
 		target := rl.LoadRenderTexture(ICON_RES, ICON_RES)
 		if target.id != 0 {
 			rl.SetTextureFilter(target.texture, .BILINEAR)
 			rl.SetTextureWrap(target.texture, .CLAMP)
-			draw_icon_mesh(renderer, &mesh, target)
+			draw_icon_mesh(renderer, mesh, target)
 			renderer.icons[block] = target
 		}
-		for surface in Surface {
-			if mesh.filled[surface] {
-				rl.UnloadMesh(mesh.meshes[surface])
+	}
+}
+
+unload_chunk_mesh :: proc(mesh: ^Chunk_Mesh) {
+	for surface in Surface {
+		if mesh.filled[surface] {
+			rl.UnloadMesh(mesh.meshes[surface])
+			mesh.meshes[surface] = {}
+			mesh.filled[surface] = false
+		}
+	}
+}
+
+// A drop is the block's cube, small, spinning, and hovering just off the face it landed on.
+DROP_DRAW_SCALE :: f32(0.25)
+
+draw_drops :: proc(renderer: ^Renderer, drops: []Drop_View) {
+	if len(drops) == 0 {
+		return
+	}
+	for pass in Surface_Pass {
+		if pass == .Translucent {
+			rl.BeginBlendMode(.ALPHA)
+			rlgl.DisableDepthMask()
+		}
+		for drop in drops {
+			mesh := &renderer.item_meshes[drop.block]
+			hover := 0.04 + math.sin(drop.age * 3 + drop.phase) * 0.03
+			spin := rl.MatrixRotateY(drop.age * 2.4 + drop.phase)
+			scale := rl.MatrixScale(DROP_DRAW_SCALE, DROP_DRAW_SCALE, DROP_DRAW_SCALE)
+			place := rl.MatrixTranslate(drop.position.x, drop.position.y + hover, drop.position.z)
+			transform := place * spin * scale
+			for surface in Surface {
+				if mesh.filled[surface] && surface_pass(surface) == pass {
+					rl.DrawMesh(mesh.meshes[surface], renderer.materials[surface], transform)
+				}
 			}
+		}
+		if pass == .Translucent {
+			rlgl.EnableDepthMask()
+			rl.EndBlendMode()
 		}
 	}
 }

@@ -3,10 +3,10 @@ package main
 import "core:c"
 import rl "vendor:raylib"
 
-// Nine slots on screen, plus three storage rows behind the inventory screen.
-// The hotbar is the front of the array, so a mined block lands there first.
-HOTBAR_SLOTS    :: 9
-STORAGE_ROWS    :: 3
+// Ten slots on screen, plus five storage rows behind the inventory screen.
+// The hotbar is the front of the array, so a picked-up block lands there first.
+HOTBAR_SLOTS    :: 10
+STORAGE_ROWS    :: 5
 INVENTORY_SLOTS :: HOTBAR_SLOTS * (STORAGE_ROWS + 1)
 STACK_MAX       :: 64
 
@@ -19,9 +19,14 @@ TITLE_H    :: f32(42)
 HINT_H     :: f32(34)
 HOTBAR_SCREEN_MARGIN :: f32(14)
 
+// 1 through 9 select the first nine hotbar slots. 0 selects the tenth.
 HOTBAR_KEYS := [HOTBAR_SLOTS]rl.KeyboardKey {
-	.ONE, .TWO, .THREE, .FOUR, .FIVE, .SIX, .SEVEN, .EIGHT, .NINE,
+	.ONE, .TWO, .THREE, .FOUR, .FIVE, .SIX, .SEVEN, .EIGHT, .NINE, .ZERO,
 }
+
+// The Steve preview sits to the left of the storage rows.
+PREVIEW_W   :: f32(150)
+PREVIEW_GAP :: f32(12)
 
 Slot :: struct {
 	block: Block,
@@ -183,8 +188,9 @@ inventory_place :: proc(inv: ^Inventory, player: Player, world: ^World, x, y, z:
 }
 
 Inventory_Layout :: struct {
-	panel: rl.Rectangle,
-	slots: [INVENTORY_SLOTS]rl.Rectangle,
+	panel:   rl.Rectangle,
+	slots:   [INVENTORY_SLOTS]rl.Rectangle,
+	preview: rl.Rectangle,
 }
 
 inventory_layout :: proc(open: bool) -> Inventory_Layout {
@@ -203,7 +209,7 @@ inventory_layout :: proc(open: bool) -> Inventory_Layout {
 	}
 
 	grid_h := f32(STORAGE_ROWS)*SLOT_SIZE + f32(STORAGE_ROWS-1)*SLOT_GAP
-	panel_w := row_w + PANEL_PAD*2
+	panel_w := PREVIEW_W + PREVIEW_GAP + row_w + PANEL_PAD*2
 	panel_h := TITLE_H + grid_h + HOTBAR_GAP + SLOT_SIZE + HINT_H
 	panel := rl.Rectangle {
 		x      = (sw - panel_w) * 0.5,
@@ -213,8 +219,9 @@ inventory_layout :: proc(open: bool) -> Inventory_Layout {
 	}
 	layout.panel = panel
 
-	origin_x := panel.x + PANEL_PAD
+	origin_x := panel.x + PANEL_PAD + PREVIEW_W + PREVIEW_GAP
 	grid_y := panel.y + TITLE_H
+	layout.preview = {panel.x + PANEL_PAD, grid_y, PREVIEW_W, grid_h}
 	for row in 0 ..< STORAGE_ROWS {
 		for col in 0 ..< HOTBAR_SLOTS {
 			index := HOTBAR_SLOTS + row*HOTBAR_SLOTS + col
@@ -255,6 +262,8 @@ draw_inventory :: proc(font: rl.Font, renderer: ^Renderer, inv: Inventory) {
 		rl.DrawRectangle(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), {0, 0, 0, 140})
 		rl.DrawRectangleRec(layout.panel, {24, 24, 24, 235})
 		rl.DrawRectangleLinesEx(layout.panel, 2, {80, 80, 80, 255})
+		rl.DrawRectangleRec(layout.preview, {14, 14, 14, 200})
+		draw_player_preview(renderer, layout.preview, mouse)
 		rl.DrawTextEx(font, "Inventory", {layout.panel.x + PANEL_PAD, layout.panel.y + 12}, HUD_SIZE, HUD_SPACING, rl.WHITE)
 		if index, hovered := inventory_slot_at(mouse); hovered && inv.slots[index].count > 0 {
 			name := block_name(inv.slots[index].block)
@@ -270,7 +279,7 @@ draw_inventory :: proc(font: rl.Font, renderer: ^Renderer, inv: Inventory) {
 		}
 		rl.DrawTextEx(
 			font,
-			"E or Esc to close",
+			"Q to drop    E or Esc to close",
 			{layout.panel.x + PANEL_PAD, layout.panel.y + layout.panel.height - 26},
 			HUD_SIZE,
 			HUD_SPACING,
