@@ -81,7 +81,7 @@ for _ in 0 ..< 3 {
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.SKYBLUE)
 	rl.BeginMode3D(camera_from_player(player))
-	draw_world(&renderer, &world)
+	draw_world(&renderer, &world, camera_from_player(player), {0, 0, 0}, nil)
 	rl.EndMode3D()
 	rl.EndDrawing()
 }
@@ -107,8 +107,9 @@ finishing. `git status --short` should show only intended changes.
   and growing the map would move inline values.
 - **Mesh arrays must come from `rl.MemAllocator()`,** because `UnloadMesh` frees them
   itself. That is what `clone_for_raylib` is for.
-- **`u16` mesh indices only fit because `CHUNK_SIZE` is 16.** Raising it needs wider
-  indices or split meshes.
+- **`u16` mesh indices fit a 32-chunk's opaque shell.** A leafy chunk does not cull
+  faces against other leaves, so that mesh is split before the index count passes
+  65535.
 - **`UnloadMaterial` also unloads the material's texture and any non-default shader.**
   Do not unload those separately. `renderer_destroy` hands the default shader back
   before unloading, so the shared cutout shader is freed exactly once.

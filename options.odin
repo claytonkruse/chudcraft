@@ -55,7 +55,7 @@ options_close :: proc(options: ^Options) {
 	rl.DisableCursor()
 }
 
-options_handle_click :: proc(options: ^Options, textures: Block_Textures, sprites: Item_Sprites, taa: ^TAA) {
+options_handle_click :: proc(options: ^Options, textures: Block_Textures, atlas: rl.Texture2D, sprites: Item_Sprites, taa: ^TAA) {
 	if !options.open {
 		return
 	}
@@ -71,7 +71,7 @@ options_handle_click :: proc(options: ^Options, textures: Block_Textures, sprite
 			switch id {
 			case .Mipmaps:
 				options.mipmaps = !options.mipmaps
-				set_block_mipmaps(textures, options.mipmaps)
+				set_block_mipmaps(textures, atlas, options.mipmaps)
 				set_item_mipmaps(sprites, options.mipmaps)
 			case .TAA:
 				options.taa = !options.taa

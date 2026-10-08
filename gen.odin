@@ -4,8 +4,8 @@ import "core:math"
 import "core:math/noise"
 import "core:math/rand"
 
-// World generation. Writes only through set_block, so everything it produces marks
-// the same dirty chunks that mining does and gets remeshed the same way.
+// World generation. While a column is being filled it writes the chunk array
+// directly. Grass and leaves are scheduled once the column is complete.
 // Nothing here knows how a block is drawn.
 
 // A new world each launch. rand.uint64 is lazily seeded from the OS, so this is
@@ -18,11 +18,12 @@ generate_seed :: proc() -> i64 {
 // options screen says otherwise. The world has no edge; columns farther than a
 // player's distance are not built, and columns past their unload margin are
 // dropped until someone walks back.
-RENDER_DISTANCE     :: 8
+// 4 chunks of 32 is the same 128-block view the old 8 chunks of 16 had.
+RENDER_DISTANCE     :: 4
 RENDER_DISTANCE_MIN :: 2
-RENDER_DISTANCE_MAX :: 16
-// Kept past the chosen distance so stepping back does not rebuild the edge.
-UNLOAD_MARGIN :: 2
+RENDER_DISTANCE_MAX :: 64
+// One extra 32-chunk, the same block margin as the old two extra 16-chunks.
+UNLOAD_MARGIN :: 1
 
 // A player standing on block (x, z) who keeps `radius` chunks loaded.
 // A radius outside the allowed range means the default.
@@ -60,6 +61,11 @@ WATER_LEVEL :: 58
 World_Gen :: struct {
 	columns: map[[2]int]bool,
 	loaded:  map[[2]int]bool,
+	// Player chunk columns last time far chunks were dropped. Unload waits
+	// until that set changes.
+	watched:     map[[3]int]bool,
+	watch_ready: bool,
+	drop_keys:   [dynamic][3]int,
 }
 
 // Fills the render distance around the origin. Play does not use this; it
@@ -99,32 +105,32 @@ terrain_height :: proc(seed: i64, x, z: int) -> int {
 // Fills one column from the bedrock floor up to `height`, which is the Y the player
 // stands at. Air is never written, so columns only allocate the chunks they occupy.
 generate_column :: proc(world: ^World, seed: i64, x, z: int, height: int) {
-	set_block(world, x, 0, z, .Bedrock)
+	write_gen_block(world, x, 0, z, .Bedrock)
 
 	// The jagged band: half of these come out bedrock, so the floor is uneven.
 	for y in 1 ..< BEDROCK_DEPTH {
 		jagged := column_hash(seed, SALT_BEDROCK + i64(y), x, z) & 1 == 0
-		set_block(world, x, y, z, .Bedrock if jagged else .Stone)
+		write_gen_block(world, x, y, z, .Bedrock if jagged else .Stone)
 	}
 
 	grass_y := height - 1
 	dirt_y := grass_y - DIRT_DEPTH
 
 	for y in BEDROCK_DEPTH ..< dirt_y {
-		set_block(world, x, y, z, .Stone)
+		write_gen_block(world, x, y, z, .Stone)
 	}
 	for y in max(dirt_y, BEDROCK_DEPTH) ..< grass_y {
-		set_block(world, x, y, z, .Dirt)
+		write_gen_block(world, x, y, z, .Dirt)
 	}
 	if grass_y >= BEDROCK_DEPTH {
 		// Grass does not grow underwater, so a flooded column is capped with dirt.
-		set_block(world, x, grass_y, z, .Grass if height >= WATER_LEVEL else .Dirt)
+		write_gen_block(world, x, grass_y, z, .Grass if height >= WATER_LEVEL else .Dirt)
 	}
 
 	// A low column floods up to the water line, which is what puts lakes in the
 	// valleys the heightmap already produced.
 	for y in height ..< WATER_LEVEL {
-		set_block(world, x, y, z, .Water)
+		write_gen_block(world, x, y, z, .Water)
 	}
 }
 
@@ -164,7 +170,7 @@ place_vein :: proc(world: ^World, seed: i64, ore: Ore, cx, cz: int, index, attem
 		// Stone only, which keeps ore out of the bedrock, out of the dirt and grass
 		// cap, and out of the air above the surface, with no special cases.
 		if get_block(world, pos.x, pos.y, pos.z) == .Stone {
-			set_block(world, pos.x, pos.y, pos.z, ore.block)
+			write_gen_block(world, pos.x, pos.y, pos.z, ore.block)
 		}
 		// Re-mixed each step, because a vein walks further than 64 bits will carry.
 		h = hash_u64(h)
@@ -190,7 +196,7 @@ place_oak :: proc(world: ^World, x, base_y, z: int, trunk: int) {
 		// stays, which matters once trees arrive after play has started.
 		block := get_block(world, x, y, z)
 		if block == .Air || block == .Oak_Leaves {
-			set_block(world, x, y, z, .Oak_Log)
+			write_gen_block(world, x, y, z, .Oak_Log)
 		}
 	}
 
@@ -210,7 +216,7 @@ leaf_layer :: proc(world: ^World, x, y, z: int, radius: int, cut_corners: bool) 
 			}
 			// Air only, so a canopy can never eat its own trunk or a neighbor's.
 			if get_block(world, x + dx, y, z + dz) == .Air {
-				set_block(world, x + dx, y, z + dz, .Oak_Leaves)
+				write_gen_block(world, x + dx, y, z + dz, .Oak_Leaves)
 			}
 		}
 	}
@@ -250,6 +256,8 @@ world_gen_init :: proc(gen: ^World_Gen) {
 world_gen_destroy :: proc(gen: ^World_Gen) {
 	delete(gen.columns)
 	delete(gen.loaded)
+	delete(gen.watched)
+	delete(gen.drop_keys)
 	gen^ = {}
 }
 
@@ -270,7 +278,39 @@ world_gen_advance :: proc(gen: ^World_Gen, world: ^World, seed: i64, spots: []Lo
 	if cx, cz, ok := world_gen_nearest(gen, spots); ok {
 		world_gen_ensure(gen, world, seed, cx, cz)
 	}
-	world_unload_far(gen, world, spots)
+	if world_gen_spots_changed(gen, spots) {
+		world_unload_far(gen, world, spots)
+	}
+}
+
+world_gen_spots_changed :: proc(gen: ^World_Gen, spots: []Load_Spot) -> bool {
+	origins := spots
+	fallback := [1]Load_Spot{{0, 0, RENDER_DISTANCE}}
+	if len(origins) == 0 {
+		origins = fallback[:]
+	}
+	next: map[[3]int]bool
+	for spot in origins {
+		origin := chunk_of(spot.x, 0, spot.z)
+		next[[3]int{origin.x, origin.z, unload_radius(spot.radius)}] = true
+	}
+	same := gen.watch_ready && len(next) == len(gen.watched)
+	if same {
+		for key, _ in next {
+			if !gen.watched[key] {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		delete(next)
+		return false
+	}
+	delete(gen.watched)
+	gen.watched = next
+	gen.watch_ready = true
+	return true
 }
 
 // Brings one column into memory. The first visit writes terrain, water, ore, and
@@ -301,6 +341,7 @@ world_gen_ensure :: proc(gen: ^World_Gen, world: ^World, seed: i64, cx, cz: int)
 	// vein or canopy that falls here. The neighbor's own column writes the rest.
 	world_gen_ores(world, seed, cx, cz)
 	world_gen_trees(gen, world, seed, cx, cz)
+	world_gen_schedule(world, cx, cz)
 
 	gen.columns[column] = true
 	gen.loaded[column] = true
@@ -415,22 +456,58 @@ world_gen_nearest :: proc(gen: ^World_Gen, spots: []Load_Spot) -> (cx, cz: int, 
 // Edited chunks wait here. A pristine column is regenerated from the seed, so
 // it does not need a copy.
 world_restore_column :: proc(world: ^World, cx, cz: int) {
-	keys: [dynamic][3]int
-	defer delete(keys)
-	for key, _ in world.cold {
-		if key.x == cx && key.z == cz {
-			append(&keys, key)
-		}
+	column := [2]int{cx, cz}
+	bin := world.cold[column]
+	if len(bin) == 0 {
+		return
 	}
-	for key in keys {
-		chunk := world.cold[key]
+	for piece in bin {
+		key := [3]int{cx, piece.y, cz}
+		chunk := piece.chunk
 		chunk.keep = true
-		chunk.dirty = true
+		mark_dirty(world, key, chunk)
 		world.chunks[key] = chunk
 		if world.syncing {
 			note_sync(world, key, chunk)
 		}
-		delete_key(&world.cold, key)
+	}
+	delete(bin)
+	delete_key(&world.cold, column)
+}
+
+// Grass spread and leaf decay, for the blocks that can have them. Stone never
+// schedules anything, so it is not visited through set_block.
+world_gen_schedule :: proc(world: ^World, cx, cz: int) {
+	keys: [dynamic][3]int
+	defer delete(keys)
+	for key, chunk in world.chunks {
+		if key.x != cx || key.z != cz || chunk.keep {
+			continue
+		}
+		append(&keys, key)
+	}
+	for key in keys {
+		chunk := world.chunks[key]
+		if chunk == nil {
+			continue
+		}
+		base := key * CHUNK_SIZE
+		for lx in 0 ..< CHUNK_SIZE {
+			for ly in 0 ..< CHUNK_SIZE {
+				for lz in 0 ..< CHUNK_SIZE {
+					block := chunk.blocks[lx][ly][lz]
+					x := base.x + lx
+					y := base.y + ly
+					z := base.z + lz
+					#partial switch block {
+					case .Grass, .Dirt:
+						reschedule(world, x, y, z, world.time)
+					case .Oak_Leaves:
+						reconsider_leaf(world, x, y, z, world.time)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -442,8 +519,7 @@ world_unload_far :: proc(gen: ^World_Gen, world: ^World, spots: []Load_Spot) {
 	if len(origins) == 0 {
 		origins = fallback[:]
 	}
-	keys: [dynamic][3]int
-	defer delete(keys)
+	clear(&gen.drop_keys)
 	for key, _ in world.chunks {
 		near := false
 		for spot in origins {
@@ -454,18 +530,22 @@ world_unload_far :: proc(gen: ^World_Gen, world: ^World, spots: []Load_Spot) {
 			}
 		}
 		if !near {
-			append(&keys, key)
+			append(&gen.drop_keys, key)
 		}
 	}
-	for key in keys {
+	for key in gen.drop_keys {
 		chunk := world.chunks[key]
 		delete_key(&world.chunks, key)
 		delete_key(&gen.loaded, [2]int{key.x, key.z})
 		if chunk.queued {
 			chunk.queued = false
 		}
+		chunk.listed = false
 		if chunk.edited || len(chunk.pending) > 0 {
-			world.cold[key] = chunk
+			column := [2]int{key.x, key.z}
+			bin := world.cold[column]
+			append(&bin, Cold_Piece{y = key.y, chunk = chunk})
+			world.cold[column] = bin
 		} else {
 			delete(chunk.pending)
 			free(chunk)

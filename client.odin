@@ -20,15 +20,26 @@ Client :: struct {
 	link:      ^Client_Link,
 	// This window's mouse gesture. The server hears it when the button comes up.
 	drag:      Drag,
+	// Seconds left before a held right click may place again. Zero places now.
+	place_delay: f32,
 	// The previous left click, so a second one on the same slot can gather.
 	clicks:    Click_Memory,
 	// Ingredients on placed workbenches, copied from the server each step.
 	tables:    map[[3]int][CRAFT3_N]Slot,
 	// The block whose 3x3 this window is editing. Meaningful while inventory.table.
 	table_at:  [3]int,
+	// Chunks dropped since the last draw. The renderer frees those meshes and
+	// does not scan the rest.
+	retired:    [dynamic][3]int,
+	drop_keys:  [dynamic][3]int,
+	cull_ready: bool,
+	cull_cx:    int,
+	cull_cz:    int,
+	cull_limit: int,
 }
 
 client_connect :: proc(client: ^Client, server: ^Server, render_distance: int) {
+	client.world.meshing = true
 	client.server = server
 	client.seed = server.seed
 	// A loaded world already has its player. A new one still has to be born.
@@ -70,6 +81,8 @@ client_destroy :: proc(client: ^Client) {
 	delete(client.drops)
 	delete(client.walks)
 	delete(client.tables)
+	delete(client.retired)
+	delete(client.drop_keys)
 	world_destroy(&client.world)
 	client.server = nil
 	client.id = 0
@@ -114,11 +127,11 @@ client_pull :: proc(client: ^Client, render_distance: int) {
 			client.world.chunks[key] = dst
 		}
 		dst.blocks = src.blocks
-		dst.dirty = true
+		mark_dirty(&client.world, key, dst)
 		src.queued = false
 	}
 	clear(&client.server.world.sync_queue)
-	client_cull_chunks(client, render_distance)
+	client_cull_around(client, render_distance)
 	clear(&client.drops)
 	for drop in client.server.drops {
 		append(&client.drops, Drop_View{
@@ -145,23 +158,35 @@ client_pull :: proc(client: ^Client, render_distance: int) {
 
 // Forgets chunks past the unload margin. The server sends a column again when
 // this player walks back into its render distance.
-client_cull_chunks :: proc(client: ^Client, render_distance: int) {
+client_cull_around :: proc(client: ^Client, render_distance: int) {
 	bx := block_index_horizontal(client.player.position.x)
 	bz := block_index_horizontal(client.player.position.z)
 	origin := chunk_of(bx, 0, bz)
-	drop: [dynamic][3]int
-	defer delete(drop)
 	limit := unload_radius(render_distance)
+	if client.cull_ready && origin.x == client.cull_cx && origin.z == client.cull_cz && limit == client.cull_limit {
+		return
+	}
+	client.cull_ready = true
+	client.cull_cx = origin.x
+	client.cull_cz = origin.z
+	client.cull_limit = limit
+	client_cull_chunks(client, origin, limit)
+}
+
+client_cull_chunks :: proc(client: ^Client, origin: [3]int, limit: int) {
+	clear(&client.drop_keys)
 	for key, _ in client.world.chunks {
 		if !column_in_radius(key.x, key.z, origin.x, origin.z, limit) {
-			append(&drop, key)
+			append(&client.drop_keys, key)
 		}
 	}
-	for key in drop {
+	for key in client.drop_keys {
 		chunk := client.world.chunks[key]
+		chunk.listed = false
 		delete(chunk.pending)
 		free(chunk)
 		delete_key(&client.world.chunks, key)
+		append(&client.retired, key)
 	}
 }
 
@@ -177,8 +202,12 @@ apply_open_table :: proc(client: ^Client) {
 	}
 }
 
+// How long a held right click waits between blocks. The first one is immediate
+// because the delay starts at zero; letting go starts the next press over.
+PLACE_REPEAT :: 0.2
+
 // Keys and mouse become a message. Nothing here changes the world.
-client_read_input :: proc(player: Player, playing, inventory_open, table: bool, inv: Inventory, drag: ^Drag, clicks: ^Click_Memory, selected: int, move_dt: f32) -> Client_Input {
+client_read_input :: proc(player: Player, playing, inventory_open, table: bool, inv: Inventory, drag: ^Drag, clicks: ^Click_Memory, place_delay: ^f32, selected: int, move_dt: f32) -> Client_Input {
 	input := Client_Input{
 		move = {
 			dt = move_dt,
@@ -197,7 +226,17 @@ client_read_input :: proc(player: Player, playing, inventory_open, table: bool, 
 	}
 	if playing {
 		input.attack = rl.IsMouseButtonPressed(.LEFT)
-		input.use = rl.IsMouseButtonPressed(.RIGHT)
+		if rl.IsMouseButtonDown(.RIGHT) {
+			if place_delay^ > 0 {
+				place_delay^ -= move_dt
+			}
+			if place_delay^ <= 0 {
+				input.use = true
+				place_delay^ = PLACE_REPEAT
+			}
+		} else {
+			place_delay^ = 0
+		}
 		// Scroll up moves toward slot 1, matching the order of the number keys.
 		wheel := rl.GetMouseWheelMove()
 		if wheel > 0 {
@@ -218,6 +257,7 @@ client_read_input :: proc(player: Player, playing, inventory_open, table: bool, 
 		}
 		return input
 	}
+	place_delay^ = 0
 	if inventory_open {
 		mouse := rl.GetMousePosition()
 		// The slot under the cursor, or the stack on it when the cursor is elsewhere.

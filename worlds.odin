@@ -19,7 +19,11 @@ World_Card :: struct {
 
 WORLD_DIR     :: "worlds"
 WORLD_MAGIC   :: u32(0x44554843)
-WORLD_VERSION :: u32(2)
+WORLD_VERSION :: u32(3)
+// Chunks were 16 wide through version 2. Those blobs are copied into the 32-chunk
+// that contains their blocks.
+WORLD_VERSION_CHUNK16 :: u32(2)
+OLD_CHUNK :: 16
 // Saves from the fixed 16x16 region. Still readable; new saves are version 2.
 WORLD_VERSION_REGION :: u32(1)
 WORLD_NAME_MAX :: 32
@@ -197,9 +201,17 @@ world_save :: proc(server: ^Server, card: ^World_Card, player_id: u32) -> bool {
 		write_player(&buf, player)
 	}
 
-	write_u32(&buf, u32(len(server.world.chunks)+len(server.world.cold)))
+	cold_n := 0
+	for _, bin in server.world.cold {
+		cold_n += len(bin)
+	}
+	write_u32(&buf, u32(len(server.world.chunks)+cold_n))
 	write_saved_chunks(&buf, server.world.chunks)
-	write_saved_chunks(&buf, server.world.cold)
+	for column, bin in server.world.cold {
+		for piece in bin {
+			write_saved_chunk(&buf, [3]int{column.x, piece.y, column.y}, piece.chunk)
+		}
+	}
 
 	write_u32(&buf, u32(len(server.tables)))
 	for at, grid in server.tables {
@@ -242,7 +254,7 @@ world_load :: proc(card: ^World_Card) -> (server: Server, reason: string) {
 		return {}, "Could not open that world."
 	}
 	version := read_u32(&reader)
-	if version != WORLD_VERSION && version != WORLD_VERSION_REGION {
+	if version != WORLD_VERSION && version != WORLD_VERSION_CHUNK16 && version != WORLD_VERSION_REGION {
 		return {}, "Could not open that world."
 	}
 	name_len := int(read_u8(&reader))
@@ -262,7 +274,7 @@ world_load :: proc(card: ^World_Card) -> (server: Server, reason: string) {
 			for x in 0 ..< OLD_GROUND {
 				flag := read_u8(&reader)
 				if flag != 0 {
-					server.gen.columns[{x + OLD_MIN, z + OLD_MIN}] = true
+					server.gen.columns[migrate_column(x+OLD_MIN, z+OLD_MIN)] = true
 				}
 			}
 		}
@@ -274,9 +286,13 @@ world_load :: proc(card: ^World_Card) -> (server: Server, reason: string) {
 		}
 		for _ in 0 ..< columns {
 			column := [2]int{int(read_i32(&reader)), int(read_i32(&reader))}
-			if reader.ok {
-				server.gen.columns[column] = true
+			if !reader.ok {
+				continue
 			}
+			if version < WORLD_VERSION {
+				column = migrate_column(column.x, column.y)
+			}
+			server.gen.columns[column] = true
 		}
 	}
 	server.next_id = read_u32(&reader)
@@ -309,22 +325,30 @@ world_load :: proc(card: ^World_Card) -> (server: Server, reason: string) {
 	for _ in 0 ..< chunks {
 		key := [3]int{int(read_i32(&reader)), int(read_i32(&reader)), int(read_i32(&reader))}
 		n := size_of([CHUNK_SIZE][CHUNK_SIZE][CHUNK_SIZE]Block)
+		if version < WORLD_VERSION {
+			n = OLD_CHUNK * OLD_CHUNK * OLD_CHUNK
+		}
 		if !reader.ok || reader.i+n > len(reader.b) {
 			server_destroy(&server)
 			return {}, "Could not open that world."
 		}
+		if version < WORLD_VERSION {
+			old: [OLD_CHUNK][OLD_CHUNK][OLD_CHUNK]Block
+			mem.copy(&old, raw_data(reader.b[reader.i:]), n)
+			reader.i += n
+			blit_old_chunk(&server.world, key, old)
+			continue
+		}
 		chunk := new(Chunk)
 		mem.copy(&chunk.blocks, raw_data(reader.b[reader.i:]), n)
 		reader.i += n
-		// Disk blocks win over a fresh generate. Version 1 stored every chunk
-		// of its small map; version 2 stores the loaded set plus edits.
+		// Disk blocks win over a fresh generate.
 		chunk.edited = true
 		chunk.keep = true
-		if version == WORLD_VERSION_REGION {
-			server.world.chunks[key] = chunk
-		} else {
-			server.world.cold[key] = chunk
-		}
+		column := [2]int{key.x, key.z}
+		bin := server.world.cold[column]
+		append(&bin, Cold_Piece{y = key.y, chunk = chunk})
+		server.world.cold[column] = bin
 	}
 	server_settle_chunks(&server)
 
@@ -361,13 +385,46 @@ world_load :: proc(card: ^World_Card) -> (server: Server, reason: string) {
 	return server, ""
 }
 
+// An old column index counts 16-wide chunks. The 32-chunk that covers its first block
+// is the column those blocks live in now.
+migrate_column :: proc(cx, cz: int) -> [2]int {
+	return {(cx * OLD_CHUNK) >> CHUNK_SHIFT, (cz * OLD_CHUNK) >> CHUNK_SHIFT}
+}
+
+// Copies one 16-chunk into the 32-chunk that contains its world coordinates.
+blit_old_chunk :: proc(world: ^World, old_key: [3]int, blocks: [OLD_CHUNK][OLD_CHUNK][OLD_CHUNK]Block) {
+	origin_x := old_key.x * OLD_CHUNK
+	origin_y := old_key.y * OLD_CHUNK
+	origin_z := old_key.z * OLD_CHUNK
+	key := chunk_of(origin_x, origin_y, origin_z)
+	local := local_of(origin_x, origin_y, origin_z)
+	chunk := world.chunks[key]
+	if chunk == nil {
+		chunk = new(Chunk)
+		world.chunks[key] = chunk
+	}
+	for x in 0 ..< OLD_CHUNK {
+		for y in 0 ..< OLD_CHUNK {
+			for z in 0 ..< OLD_CHUNK {
+				chunk.blocks[local.x+x][local.y+y][local.z+z] = blocks[x][y][z]
+			}
+		}
+	}
+	chunk.edited = true
+	chunk.keep = true
+}
+
+write_saved_chunk :: proc(buf: ^[dynamic]u8, key: [3]int, chunk: ^Chunk) {
+	write_i32(buf, i32(key.x))
+	write_i32(buf, i32(key.y))
+	write_i32(buf, i32(key.z))
+	bytes := mem.slice_ptr(([^]u8)(&chunk.blocks), size_of(chunk.blocks))
+	append(buf, ..bytes)
+}
+
 write_saved_chunks :: proc(buf: ^[dynamic]u8, chunks: map[[3]int]^Chunk) {
 	for key, chunk in chunks {
-		write_i32(buf, i32(key.x))
-		write_i32(buf, i32(key.y))
-		write_i32(buf, i32(key.z))
-		bytes := mem.slice_ptr(([^]u8)(&chunk.blocks), size_of(chunk.blocks))
-		append(buf, ..bytes)
+		write_saved_chunk(buf, key, chunk)
 	}
 }
 

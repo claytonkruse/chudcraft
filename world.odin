@@ -20,8 +20,8 @@ Block :: enum u8 {
 }
 
 // A power of two, so splitting a world coordinate is a shift and a mask.
-CHUNK_SIZE  :: 16
-CHUNK_SHIFT :: 4
+CHUNK_SIZE  :: 32
+CHUNK_SHIFT :: 5
 CHUNK_MASK  :: CHUNK_SIZE - 1
 
 // How far, in meters, a look ray can break a block.
@@ -34,6 +34,8 @@ Chunk :: struct {
 	blocks: [CHUNK_SIZE][CHUNK_SIZE][CHUNK_SIZE]Block,
 	// Set when a block here changed, so this chunk's mesh gets rebuilt.
 	dirty:  bool,
+	// Already sitting in World.dirty, so a second edit does not queue it twice.
+	listed: bool,
 	// Dirt waiting to become grass, and leaves waiting to decay, soonest first.
 	// A check stops at the first date that is not due. Absent while the chunk is
 	// unloaded; the date is what lets the change happen anyway.
@@ -44,6 +46,12 @@ Chunk :: struct {
 	edited:  bool,
 	// Restored from a save or an unload. Generation will not overwrite it.
 	keep:    bool,
+}
+
+// One unloaded chunk, kept with the other chunks of its column.
+Cold_Piece :: struct {
+	y:     int,
+	chunk: ^Chunk,
 }
 
 // Chunks exist only where blocks do, which is what leaves the world without a build
@@ -62,8 +70,13 @@ World :: struct {
 	// column is copied once instead of one change per block.
 	syncing:    bool,
 	sync_queue: [dynamic][3]int,
-	// Chunks outside the render distance that still hold edits or deadlines.
-	cold:       map[[3]int]^Chunk,
+	// Chunks whose mesh is out of date, nearest-first when drawn.
+	dirty:      [dynamic][3]int,
+	// The world a window draws. The server copy stays false, so its edits do
+	// not grow a queue nobody drains.
+	meshing:    bool,
+	// Edits and deadlines parked by column, so walking back restores that column only.
+	cold:       map[[2]int][dynamic]Cold_Piece,
 	// While set, generation only writes this column. A kept chunk is one that
 	// was restored, and this pass must not overwrite it.
 	gen_clip:   bool,
@@ -81,14 +94,18 @@ world_destroy :: proc(world: ^World) {
 		delete(chunk.pending)
 		free(chunk)
 	}
-	for _, chunk in world.cold {
-		delete(chunk.pending)
-		free(chunk)
+	for _, bin in world.cold {
+		for piece in bin {
+			delete(piece.chunk.pending)
+			free(piece.chunk)
+		}
+		delete(bin)
 	}
 	delete(world.chunks)
 	delete(world.cold)
 	delete(world.changes)
 	delete(world.sync_queue)
+	delete(world.dirty)
 }
 
 // A shift floors toward negative infinity. Odin's `/` truncates toward zero, which
@@ -159,7 +176,7 @@ store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, w
 		return old, false
 	}
 	chunk.blocks[l.x][l.y][l.z] = block
-	chunk.dirty = true
+	mark_dirty(world, key, chunk)
 	if world.syncing {
 		note_sync(world, key, chunk)
 	}
@@ -173,7 +190,7 @@ store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, w
 		neighbor := key
 		neighbor[axis] += -1 if l[axis] == 0 else 1
 		if adjacent, ok := world.chunks[neighbor]; ok {
-			adjacent.dirty = true
+			mark_dirty(world, neighbor, adjacent)
 			if world.syncing {
 				note_sync(world, neighbor, adjacent)
 			}
@@ -184,6 +201,58 @@ store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, w
 		append(&world.changes, Block_Change{x = x, y = y, z = z, block = block})
 	}
 	return old, true
+}
+
+mark_dirty :: proc(world: ^World, key: [3]int, chunk: ^Chunk) {
+	chunk.dirty = true
+	if !world.meshing || chunk.listed {
+		return
+	}
+	chunk.listed = true
+	append(&world.dirty, key)
+}
+
+// Writes a generated block without growth bookkeeping. The column schedules
+// grass and leaves once, after every block is in place. A kept chunk is one
+// that was restored, and this pass must not overwrite it.
+write_gen_block :: proc(world: ^World, x, y, z: int, block: Block) {
+	if block == .Air {
+		return
+	}
+	if world.gen_clip && !gen_clip_allows(world, x, z) {
+		return
+	}
+	key := chunk_of(x, y, z)
+	chunk := world.chunks[key]
+	if chunk != nil && chunk.keep && world.gen_clip {
+		return
+	}
+	if chunk == nil {
+		chunk = new(Chunk)
+		world.chunks[key] = chunk
+	}
+	l := local_of(x, y, z)
+	if chunk.blocks[l.x][l.y][l.z] == block {
+		return
+	}
+	chunk.blocks[l.x][l.y][l.z] = block
+	mark_dirty(world, key, chunk)
+	if world.syncing {
+		note_sync(world, key, chunk)
+	}
+	for axis in 0 ..< 3 {
+		if l[axis] != 0 && l[axis] != CHUNK_MASK {
+			continue
+		}
+		neighbor := key
+		neighbor[axis] += -1 if l[axis] == 0 else 1
+		if adjacent, ok := world.chunks[neighbor]; ok {
+			mark_dirty(world, neighbor, adjacent)
+			if world.syncing {
+				note_sync(world, neighbor, adjacent)
+			}
+		}
+	}
 }
 
 // Inside the column being generated. Anywhere else belongs to the column that

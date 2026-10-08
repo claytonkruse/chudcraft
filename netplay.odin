@@ -16,7 +16,7 @@ import "core:net"
 // mobile-device service, so hosting there always looks like the port is ours.
 NET_PORT        :: 43720
 NET_PORT_TRIES  :: 16
-NET_VERSION     :: u32(7)
+NET_VERSION     :: u32(8)
 NET_MAX_PLAYERS :: 8
 // A chunk message is a few kilobytes. Anything larger is a broken peer.
 NET_MAX_MESSAGE :: 8 * 1024 * 1024
@@ -266,6 +266,7 @@ client_dial :: proc(client: ^Client, address: string, render_distance: int) -> s
 
 	link := new(Client_Link)
 	link.socket = socket
+	client.world.meshing = true
 	client.link = link
 	start := message_begin(&link.out, .Join)
 	write_u32(&link.out.data, NET_VERSION)
@@ -299,7 +300,7 @@ client_link_pump :: proc(client: ^Client, render_distance: int) -> bool {
 	}
 	link_recv(link)
 	link_parse(client)
-	client_cull_chunks(client, render_distance)
+	client_cull_around(client, render_distance)
 	stream_compact(&link.inbox)
 	if link.failed {
 		return false
@@ -605,7 +606,7 @@ link_parse :: proc(client: ^Client) {
 				client.world.chunks[key] = chunk
 			}
 			mem.copy(&chunk.blocks, raw_data(payload[reader.i:]), n)
-			chunk.dirty = true
+			mark_dirty(&client.world, key, chunk)
 		case .Ready, .State:
 			if !apply_state(client, payload) {
 				fail_link(link, "The host sent something this game does not understand.")

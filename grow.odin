@@ -119,9 +119,9 @@ grow_chunk :: proc(world: ^World, key: [3]int, chunk: ^Chunk, room: int) -> (rep
 }
 
 grow_fire :: proc(world: ^World, key: [3]int, d: Deadline) -> bool {
-	x := key.x*CHUNK_SIZE + int(d.i&15)
-	y := key.y*CHUNK_SIZE + int((d.i>>4)&15)
-	z := key.z*CHUNK_SIZE + int((d.i>>8)&15)
+	x := key.x*CHUNK_SIZE + int(d.i&31)
+	y := key.y*CHUNK_SIZE + int((d.i>>5)&31)
+	z := key.z*CHUNK_SIZE + int((d.i>>10)&31)
 	switch d.kind {
 	case .Grass:
 		if !grass_spread_target(world, x, y, z) {
@@ -351,7 +351,7 @@ leaf_decay_delay :: proc(x, y, z: int) -> f64 {
 }
 
 deadline_index :: proc(l: [3]int) -> u16 {
-	return u16(l.x) | u16(l.y)<<4 | u16(l.z)<<8
+	return u16(l.x) | u16(l.y)<<5 | u16(l.z)<<10
 }
 
 deadline_schedule :: proc(world: ^World, x, y, z: int, at: f64, kind: Grow_Kind) {

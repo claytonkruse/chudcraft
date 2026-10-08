@@ -311,7 +311,7 @@ main :: proc() {
 			}
 			if front == .Playing {
 				if options_were_open {
-					options_handle_click(&options, renderer.textures, renderer.sprites, &taa)
+					options_handle_click(&options, renderer.textures, renderer.atlas, renderer.sprites, &taa)
 				}
 				// Right-click on a workbench opens its grid instead of placing
 				// against it. The open has to land before the look, so this frame's
@@ -334,7 +334,7 @@ main :: proc() {
 				dt := min(f32(frame_dt), 0.05)
 				// The click that opened the table is not also a click inside it.
 				screen_open := client.inventory.open && !opened_table
-				input := client_read_input(client.player, playing, screen_open, client.inventory.table, client.inventory, &client.drag, &client.clicks, client.inventory.selected, dt)
+				input := client_read_input(client.player, playing, screen_open, client.inventory.table, client.inventory, &client.drag, &client.clicks, &client.place_delay, client.inventory.selected, dt)
 				// A pause freezes the body. dt of zero skips gravity for this player
 				// without stopping the world, or anyone else who is still playing.
 				if paused {
@@ -410,7 +410,8 @@ main :: proc() {
 				block_index_vertical(feet.y),
 				block_index_horizontal(feet.z),
 			)
-			draw_world(&renderer, &client.world, focus)
+			draw_world(&renderer, &client.world, camera, focus, client.retired[:])
+			clear(&client.retired)
 			draw_table_items(&renderer, &client.world, client.tables)
 			draw_drops(&renderer, client.drops[:], .Opaque)
 			draw_drops(&renderer, client.drops[:], .Cutout)

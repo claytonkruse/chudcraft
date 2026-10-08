@@ -139,7 +139,7 @@ Mesh_Build :: struct {
 Renderer :: struct {
 	textures:  Block_Textures,
 	materials: [Surface]rl.Material,
-	meshes:    map[[3]int]^Chunk_Mesh,
+	meshes:    map[[3]int]^World_Mesh,
 	build:     [Surface]Mesh_Build,
 	// Shared by every cutout surface, which is why renderer_destroy cannot let
 	// UnloadMaterial free it.
@@ -158,7 +158,29 @@ Renderer :: struct {
 	// Dirty chunks, nearest the player first. A frame meshes the ground underfoot
 	// and leaves the rest of a newly loaded column for the frames after.
 	pending_meshes: [dynamic]Pending_Mesh,
+	// Opaque block textures packed into one picture. World chunks sample it with
+	// atlas_shader; icons keep the loose textures.
+	atlas:          rl.Texture2D,
+	atlas_shader:   rl.Shader,
+	atlas_material: rl.Material,
+	atlas_tiles:    [16][4]f32,
+	// Planes filled by draw_world and reused for the water pass.
+	frustum:        [6][4]f32,
+	frustum_ready:  bool,
+	// One face direction of solidity, reused while a chunk is meshed.
+	masks:          [ATLAS_COUNT][CHUNK_SIZE]u32,
 }
+
+// A world chunk on the GPU: one greedy opaque mesh (split if the indices would
+// pass 65535), plus leaves and water, which stay one quad per face.
+World_Mesh :: struct {
+	opaque: [dynamic]rl.Mesh,
+	leaves: [dynamic]rl.Mesh,
+	water:  [dynamic]rl.Mesh,
+}
+
+ATLAS_COUNT :: 14
+ATLAS_PAD   :: 1
 
 renderer_init :: proc() -> Renderer {
 	renderer: Renderer
@@ -184,16 +206,13 @@ renderer_init :: proc() -> Renderer {
 		renderer.item_material.shader = renderer.cutout
 	}
 	player_model_init(&renderer)
+	build_block_atlas(&renderer)
 	return renderer
 }
 
 renderer_destroy :: proc(renderer: ^Renderer) {
 	for _, mesh in renderer.meshes {
-		for surface in Surface {
-			if mesh.filled[surface] {
-				rl.UnloadMesh(mesh.meshes[surface])
-			}
-		}
+		unload_world_mesh(mesh)
 		free(mesh)
 	}
 	delete(renderer.meshes)
@@ -231,6 +250,14 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 	}
 	unload_item_sprites(renderer.sprites)
 
+	if renderer.atlas.id != 0 {
+		renderer.atlas_material.shader = {
+			id   = rlgl.GetShaderIdDefault(),
+			locs = rlgl.GetShaderLocsDefault(),
+		}
+		rl.UnloadMaterial(renderer.atlas_material)
+		rl.UnloadShader(renderer.atlas_shader)
+	}
 	if renderer.cutout.id != 0 {
 		rl.UnloadShader(renderer.cutout)
 	}
@@ -245,7 +272,7 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 // How many chunk meshes a frame will build. The column under the player is a
 // handful of these, so the ground is visible on the frame it loads and the
 // rest of the world catches up over the frames after.
-MESH_PER_FRAME :: 8
+MESH_PER_FRAME :: 2
 
 Pending_Mesh :: struct {
 	key:  [3]int,
@@ -260,27 +287,45 @@ mesh_nearer :: proc(a, b: Pending_Mesh) -> bool {
 // Water is draw_water, and it has to come after players and drops. Those write
 // depth; water does not, so anything drawn after it composites in front of the
 // surface even when it is standing behind it.
-// focus is the chunk the player is standing in. Callers that omit it mesh
-// around the origin, which is the spawn column.
-draw_world :: proc(renderer: ^Renderer, world: ^World, focus: [3]int = {0, 0, 0}) {
-	// A column that left the render distance took its blocks with it. The mesh
-	// would keep drawing that column forever if it stayed.
-	retired: [dynamic][3]int
-	defer delete(retired)
-	for key, mesh in renderer.meshes {
-		if world.chunks[key] == nil {
-			unload_chunk_mesh(mesh)
-			free(mesh)
-			append(&retired, key)
-		}
-	}
+// retired is the chunks just unloaded. Their GPU meshes go with them, so this
+// pass does not walk every mesh looking for a missing chunk.
+draw_world :: proc(renderer: ^Renderer, world: ^World, camera: rl.Camera3D, focus: [3]int, retired: [][3]int) {
 	for key in retired {
+		mesh := renderer.meshes[key]
+		if mesh == nil {
+			continue
+		}
+		unload_world_mesh(mesh)
+		free(mesh)
 		delete_key(&renderer.meshes, key)
 	}
 
+	mesh_dirty(renderer, world, focus)
+	fill_frustum(renderer, camera)
+
+	draw_world_meshes(renderer, .Opaque)
+	draw_world_meshes(renderer, .Cutout)
+}
+
+// Water must not hide what is behind it. With depth writes off it also cannot hide
+// other water, which is what lets this pass skip sorting the meshes entirely.
+draw_water :: proc(renderer: ^Renderer) {
+	rl.BeginBlendMode(.ALPHA)
+	rlgl.DisableDepthMask()
+	draw_world_meshes(renderer, .Translucent)
+	rlgl.EnableDepthMask()
+	rl.EndBlendMode()
+}
+
+mesh_dirty :: proc(renderer: ^Renderer, world: ^World, focus: [3]int) {
 	clear(&renderer.pending_meshes)
-	for key, chunk in world.chunks {
-		if !chunk.dirty && renderer.meshes[key] != nil {
+	for key in world.dirty {
+		chunk := world.chunks[key]
+		if chunk == nil || !chunk.listed {
+			continue
+		}
+		chunk.listed = false
+		if !chunk.dirty {
 			continue
 		}
 		dx := key.x - focus.x
@@ -288,6 +333,7 @@ draw_world :: proc(renderer: ^Renderer, world: ^World, focus: [3]int = {0, 0, 0}
 		dz := key.z - focus.z
 		append(&renderer.pending_meshes, Pending_Mesh{key, dx * dx + dy * dy + dz * dz})
 	}
+	clear(&world.dirty)
 	slice.sort_by(renderer.pending_meshes[:], mesh_nearer)
 	n := min(len(renderer.pending_meshes), MESH_PER_FRAME)
 	for i in 0 ..< n {
@@ -298,26 +344,92 @@ draw_world :: proc(renderer: ^Renderer, world: ^World, focus: [3]int = {0, 0, 0}
 		}
 		mesh := renderer.meshes[key]
 		if mesh == nil {
-			mesh = new(Chunk_Mesh)
+			mesh = new(World_Mesh)
 			renderer.meshes[key] = mesh
 		}
 		build_chunk_mesh(renderer, world, key, mesh)
 		chunk.dirty = false
+		chunk.listed = false
 	}
-
-	// Depth-writing passes first, so the depth buffer is complete before anything blends.
-	draw_pass(renderer, .Opaque)
-	draw_pass(renderer, .Cutout)
+	for i in n ..< len(renderer.pending_meshes) {
+		key := renderer.pending_meshes[i].key
+		chunk := world.chunks[key]
+		if chunk == nil || !chunk.dirty {
+			continue
+		}
+		chunk.listed = true
+		append(&world.dirty, key)
+	}
 }
 
-// Water must not hide what is behind it. With depth writes off it also cannot hide
-// other water, which is what lets this pass skip sorting the meshes entirely.
-draw_water :: proc(renderer: ^Renderer) {
-	rl.BeginBlendMode(.ALPHA)
-	rlgl.DisableDepthMask()
-	draw_pass(renderer, .Translucent)
-	rlgl.EnableDepthMask()
-	rl.EndBlendMode()
+fill_frustum :: proc(renderer: ^Renderer, camera: rl.Camera3D) {
+	view := rl.GetCameraMatrix(camera)
+	proj := rlgl.GetMatrixProjection()
+	clip := proj * view
+	row := [4][4]f32 {
+		{clip[0, 0], clip[0, 1], clip[0, 2], clip[0, 3]},
+		{clip[1, 0], clip[1, 1], clip[1, 2], clip[1, 3]},
+		{clip[2, 0], clip[2, 1], clip[2, 2], clip[2, 3]},
+		{clip[3, 0], clip[3, 1], clip[3, 2], clip[3, 3]},
+	}
+	renderer.frustum[0] = row[3] + row[0]
+	renderer.frustum[1] = row[3] - row[0]
+	renderer.frustum[2] = row[3] + row[1]
+	renderer.frustum[3] = row[3] - row[1]
+	renderer.frustum[4] = row[3] + row[2]
+	renderer.frustum[5] = row[3] - row[2]
+	renderer.frustum_ready = true
+}
+
+chunk_in_frustum :: proc(renderer: ^Renderer, key: [3]int) -> bool {
+	if !renderer.frustum_ready {
+		return true
+	}
+	minp := [3]f32 {
+		f32(key.x * CHUNK_SIZE) - 0.5,
+		f32(key.y * CHUNK_SIZE),
+		f32(key.z * CHUNK_SIZE) - 0.5,
+	}
+	maxp := minp + CHUNK_SIZE
+	for plane in renderer.frustum {
+		x := maxp.x if plane[0] >= 0 else minp.x
+		y := maxp.y if plane[1] >= 0 else minp.y
+		z := maxp.z if plane[2] >= 0 else minp.z
+		if plane[0] * x + plane[1] * y + plane[2] * z + plane[3] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+draw_world_meshes :: proc(renderer: ^Renderer, pass: Surface_Pass) {
+	for key, mesh in renderer.meshes {
+		if !chunk_in_frustum(renderer, key) {
+			continue
+		}
+		origin := [3]f32 {
+			f32(key.x * CHUNK_SIZE) - 0.5,
+			f32(key.y * CHUNK_SIZE),
+			f32(key.z * CHUNK_SIZE) - 0.5,
+		}
+		transform := rl.MatrixTranslate(origin.x, origin.y, origin.z)
+		list: []rl.Mesh
+		material: rl.Material
+		switch pass {
+		case .Opaque:
+			list = mesh.opaque[:]
+			material = renderer.atlas_material
+		case .Cutout:
+			list = mesh.leaves[:]
+			material = renderer.materials[.Oak_Leaves]
+		case .Translucent:
+			list = mesh.water[:]
+			material = renderer.materials[.Water]
+		}
+		for part in list {
+			rl.DrawMesh(part, material, transform)
+		}
+	}
 }
 
 // Opaque neighbors hide a face, and so does the same see-through block. Leaf
@@ -333,73 +445,234 @@ face_culled :: proc(block, neighbor: Block) -> bool {
 	return neighbor == block
 }
 
-draw_pass :: proc(renderer: ^Renderer, pass: Surface_Pass) {
-	for key, mesh in renderer.meshes {
-		// Vertices are chunk-local, so the chunk's world position and the half-block
-		// shift that centers blocks on X and Z both live in this transform.
-		origin := [3]f32 {
-			f32(key.x * CHUNK_SIZE) - 0.5,
-			f32(key.y * CHUNK_SIZE),
-			f32(key.z * CHUNK_SIZE) - 0.5,
-		}
-		transform := rl.MatrixTranslate(origin.x, origin.y, origin.z)
-		for surface in Surface {
-			if mesh.filled[surface] && surface_pass(surface) == pass {
-				rl.DrawMesh(mesh.meshes[surface], renderer.materials[surface], transform)
-			}
-		}
-	}
-}
-
-build_chunk_mesh :: proc(renderer: ^Renderer, world: ^World, key: [3]int, out: ^Chunk_Mesh) {
-	for surface in Surface {
-		build := &renderer.build[surface]
-		clear(&build.vertices)
-		clear(&build.texcoords)
-		clear(&build.colors)
-		clear(&build.indices)
-	}
+build_chunk_mesh :: proc(renderer: ^Renderer, world: ^World, key: [3]int, out: ^World_Mesh) {
+	opaque := &renderer.build[.Stone]
+	leaves := &renderer.build[.Oak_Leaves]
+	water := &renderer.build[.Water]
+	clear(&opaque.vertices)
+	clear(&opaque.texcoords)
+	clear(&opaque.colors)
+	clear(&opaque.indices)
+	clear(&leaves.vertices)
+	clear(&leaves.texcoords)
+	clear(&leaves.colors)
+	clear(&leaves.indices)
+	clear(&water.vertices)
+	clear(&water.texcoords)
+	clear(&water.colors)
+	clear(&water.indices)
+	unload_world_mesh(out)
 
 	chunk := world.chunks[key]
-	base := key * CHUNK_SIZE
-	// Without textures the vertex tint is all the color a block has left.
 	textured := renderer.textures.stone.id != 0
+	base := key * CHUNK_SIZE
 
-	for lx in 0 ..< CHUNK_SIZE {
-		for ly in 0 ..< CHUNK_SIZE {
-			for lz in 0 ..< CHUNK_SIZE {
-				block := chunk.blocks[lx][ly][lz]
-				if block == .Air {
-					continue
+	for face in Face {
+		for slice in 0 ..< CHUNK_SIZE {
+			for tile in 0 ..< ATLAS_COUNT {
+				for row in 0 ..< CHUNK_SIZE {
+					renderer.masks[tile][row] = 0
 				}
-				for face in Face {
-					offset := FACE_OFFSET[face]
-					// Reading through the world, not the chunk, so a face against
-					// the neighboring chunk is culled too.
-					neighbor := get_block(
-						world,
-						base.x + lx + offset.x,
-						base.y + ly + offset.y,
-						base.z + lz + offset.z,
-					)
+			}
+			for a in 0 ..< CHUNK_SIZE {
+				for b in 0 ..< CHUNK_SIZE {
+					lx, ly, lz := slice_block(face, slice, a, b)
+					block := chunk.blocks[lx][ly][lz]
+					if block == .Air {
+						continue
+					}
+					neighbor := mesh_neighbor(world, chunk, key, base, lx, ly, lz, face)
 					if face_culled(block, neighbor) {
 						continue
 					}
 					surface := block_surface(block, face)
-					append_face(
-						&renderer.build[surface],
-						{f32(lx), f32(ly), f32(lz)},
-						face,
-						surface_tint(surface, textured),
-					)
+					tile := atlas_tile(surface)
+					if tile < 0 {
+						build := leaves if surface == .Oak_Leaves else water
+						ensure_mesh_room(build, leaves_list(out, surface))
+						append_face(build, {f32(lx), f32(ly), f32(lz)}, face, surface_tint(surface, textured))
+						continue
+					}
+					tu, tv := face_tile_coord(face, lx, ly, lz)
+					renderer.masks[tile][tv] |= u32(1) << uint(tu)
 				}
+			}
+			for tile in 0 ..< ATLAS_COUNT {
+				greedy_face(renderer, opaque, out, face, slice, tile, textured)
 			}
 		}
 	}
+	commit_mesh(opaque, &out.opaque)
+	commit_mesh(leaves, &out.leaves)
+	commit_mesh(water, &out.water)
+}
 
-	for surface in Surface {
-		upload_surface(out, surface, &renderer.build[surface])
+slice_block :: proc(face: Face, slice, a, b: int) -> (x, y, z: int) {
+	switch face {
+	case .Pos_Y, .Neg_Y:
+		return a, slice, b
+	case .Pos_X, .Neg_X:
+		return slice, b, a
+	case .Pos_Z, .Neg_Z:
+		return a, b, slice
 	}
+	return 0, 0, 0
+}
+
+leaves_list :: proc(out: ^World_Mesh, surface: Surface) -> ^[dynamic]rl.Mesh {
+	if surface == .Oak_Leaves {
+		return &out.leaves
+	}
+	return &out.water
+}
+
+mesh_neighbor :: proc(world: ^World, chunk: ^Chunk, key, base: [3]int, lx, ly, lz: int, face: Face) -> Block {
+	offset := FACE_OFFSET[face]
+	nx := lx + offset.x
+	ny := ly + offset.y
+	nz := lz + offset.z
+	if nx >= 0 && nx < CHUNK_SIZE && ny >= 0 && ny < CHUNK_SIZE && nz >= 0 && nz < CHUNK_SIZE {
+		return chunk.blocks[nx][ny][nz]
+	}
+	return get_block(world, base.x + lx + offset.x, base.y + ly + offset.y, base.z + lz + offset.z)
+}
+
+// Texture-space column and row of a block on this face. Bit 0 of a mask row is
+// texture u 0, so a greedy run repeats the tile in the same direction as the UVs.
+face_tile_coord :: proc(face: Face, x, y, z: int) -> (tu, tv: int) {
+	switch face {
+	case .Pos_Y:
+		return x, z
+	case .Neg_Y:
+		return x, CHUNK_MASK - z
+	case .Pos_X:
+		return CHUNK_MASK - z, CHUNK_MASK - y
+	case .Neg_X:
+		return z, CHUNK_MASK - y
+	case .Pos_Z:
+		return x, CHUNK_MASK - y
+	case .Neg_Z:
+		return CHUNK_MASK - x, CHUNK_MASK - y
+	}
+	return 0, 0
+}
+
+greedy_face :: proc(renderer: ^Renderer, build: ^Mesh_Build, out: ^World_Mesh, face: Face, slice, tile: int, textured: bool) {
+	surface := surface_from_tile(tile)
+	tint := surface_tint(surface, textured)
+	mask := &renderer.masks[tile]
+	for v in 0 ..< CHUNK_SIZE {
+		for mask[v] != 0 {
+			row := mask[v]
+			u := 0
+			for row & 1 == 0 {
+				row >>= 1
+				u += 1
+			}
+			w := 0
+			for row & 1 == 1 {
+				row >>= 1
+				w += 1
+			}
+			h := 1
+			need: u32 = ~u32(0) if w == 32 else ((u32(1) << uint(w)) - 1) << uint(u)
+			for v + h < CHUNK_SIZE && mask[v + h] & need == need {
+				h += 1
+			}
+			for k in 0 ..< h {
+				mask[v + k] &~= need
+			}
+			ensure_mesh_room(build, &out.opaque)
+			append_greedy_quad(build, face, slice, u, v, w, h, tile, tint)
+		}
+	}
+}
+
+append_greedy_quad :: proc(build: ^Mesh_Build, face: Face, slice, u, v, w, h, tile: int, tint: [4]u8) {
+	u_dir, v_dir, start := face_quad_basis(face, slice, u, v)
+	first := u16(len(build.vertices) / 3)
+	wf := f32(w)
+	hf := f32(h)
+	tile_y := f32(tile) * 64
+	for i in 0 ..< 4 {
+		tex_u := FACE_UV[i].x * wf
+		tex_v := FACE_UV[i].y * hf
+		p := start + u_dir * tex_u + v_dir * tex_v
+		append(&build.vertices, p.x, p.y, p.z)
+		append(&build.texcoords, tex_u, tex_v + tile_y)
+		append(&build.colors, tint[0], tint[1], tint[2], tint[3])
+	}
+	append(&build.indices, first, first + 1, first + 2, first, first + 2, first + 3)
+}
+
+face_quad_basis :: proc(face: Face, slice, u, v: int) -> (u_dir, v_dir, start: [3]f32) {
+	uf := f32(u)
+	vf := f32(v)
+	sf := f32(slice)
+	switch face {
+	case .Pos_Y:
+		return {1, 0, 0}, {0, 0, 1}, {uf, sf + 1, vf}
+	case .Neg_Y:
+		return {1, 0, 0}, {0, 0, -1}, {uf, sf, f32(CHUNK_MASK - v) + 1}
+	case .Pos_X:
+		return {0, 0, -1}, {0, -1, 0}, {sf + 1, f32(CHUNK_MASK - v) + 1, f32(CHUNK_MASK - u) + 1}
+	case .Neg_X:
+		return {0, 0, 1}, {0, -1, 0}, {sf, f32(CHUNK_MASK - v) + 1, uf}
+	case .Pos_Z:
+		return {1, 0, 0}, {0, -1, 0}, {uf, f32(CHUNK_MASK - v) + 1, sf + 1}
+	case .Neg_Z:
+		return {-1, 0, 0}, {0, -1, 0}, {f32(CHUNK_MASK - u) + 1, f32(CHUNK_MASK - v) + 1, sf}
+	}
+	return {}, {}, {}
+}
+
+ensure_mesh_room :: proc(build: ^Mesh_Build, into: ^[dynamic]rl.Mesh) {
+	if len(build.indices) + 6 <= 65535 {
+		return
+	}
+	commit_mesh(build, into)
+}
+
+commit_mesh :: proc(build: ^Mesh_Build, into: ^[dynamic]rl.Mesh) {
+	if len(build.indices) == 0 {
+		return
+	}
+	append(into, upload_build(build))
+	clear(&build.vertices)
+	clear(&build.texcoords)
+	clear(&build.colors)
+	clear(&build.indices)
+}
+
+upload_build :: proc(build: ^Mesh_Build) -> rl.Mesh {
+	mesh := rl.Mesh {
+		vertexCount   = c.int(len(build.vertices) / 3),
+		triangleCount = c.int(len(build.indices) / 3),
+		vertices      = clone_for_raylib(build.vertices[:]),
+		texcoords     = clone_for_raylib(build.texcoords[:]),
+		colors        = clone_for_raylib(build.colors[:]),
+		indices       = clone_for_raylib(build.indices[:]),
+	}
+	rl.UploadMesh(&mesh, false)
+	return mesh
+}
+
+unload_world_mesh :: proc(mesh: ^World_Mesh) {
+	for part in mesh.opaque {
+		rl.UnloadMesh(part)
+	}
+	for part in mesh.leaves {
+		rl.UnloadMesh(part)
+	}
+	for part in mesh.water {
+		rl.UnloadMesh(part)
+	}
+	delete(mesh.opaque)
+	delete(mesh.leaves)
+	delete(mesh.water)
+	mesh.opaque = nil
+	mesh.leaves = nil
+	mesh.water = nil
 }
 
 append_face :: proc(build: ^Mesh_Build, origin: [3]f32, face: Face, tint: [4]u8) {
@@ -831,6 +1104,127 @@ surface_tint :: proc(surface: Surface, textured: bool) -> [4]u8 {
 	return WHITE_TINT
 }
 
+// Opaque surfaces packed left to right. Water and leaves stay on their own textures.
+atlas_tile :: proc(surface: Surface) -> int {
+	#partial switch surface {
+	case .Water, .Oak_Leaves:
+		return -1
+	}
+	id := int(surface)
+	if surface > .Water {
+		id -= 1
+	}
+	if surface > .Oak_Leaves {
+		id -= 1
+	}
+	return id
+}
+
+surface_from_tile :: proc(tile: int) -> Surface {
+	id := tile
+	if id >= int(Surface.Water) {
+		id += 1
+	}
+	if id >= int(Surface.Oak_Leaves) {
+		id += 1
+	}
+	return Surface(id)
+}
+
+atlas_file :: proc(surface: Surface) -> cstring {
+	switch surface {
+	case .Grass_Top:
+		return "assets/textures/grass_block_top.png"
+	case .Grass_Side:
+		return "assets/textures/grass_block_side.png"
+	case .Dirt:
+		return "assets/textures/dirt.png"
+	case .Stone:
+		return "assets/textures/stone.png"
+	case .Bedrock:
+		return "assets/textures/bedrock.png"
+	case .Coal_Ore:
+		return "assets/textures/coal_ore.png"
+	case .Iron_Ore:
+		return "assets/textures/iron_ore.png"
+	case .Gold_Ore:
+		return "assets/textures/gold_ore.png"
+	case .Oak_Log_Top:
+		return "assets/textures/oak_log_top.png"
+	case .Oak_Log_Side:
+		return "assets/textures/oak_log.png"
+	case .Oak_Planks:
+		return "assets/textures/oak_planks.png"
+	case .Workbench_Top:
+		return "assets/textures/workbench_top.png"
+	case .Workbench_Front:
+		return "assets/textures/workbench_front.png"
+	case .Water, .Oak_Leaves:
+		return nil
+	}
+	return nil
+}
+
+// Repeats each tile's edge into a one-pixel pad so a mipmap average stays inside
+// the tile. The shader samples the inner rectangle.
+build_block_atlas :: proc(renderer: ^Renderer) {
+	first := rl.LoadImage(atlas_file(.Stone))
+	defer rl.UnloadImage(first)
+	if first.width == 0 || first.height == 0 {
+		return
+	}
+	tile_w := int(first.width)
+	tile_h := int(first.height)
+	stride_w := tile_w + ATLAS_PAD * 2
+	stride_h := tile_h + ATLAS_PAD * 2
+	image := rl.GenImageColor(c.int(stride_w * ATLAS_COUNT), c.int(stride_h), rl.BLANK)
+	defer rl.UnloadImage(image)
+	for surface in Surface {
+		tile := atlas_tile(surface)
+		if tile < 0 {
+			continue
+		}
+		src := first
+		owned := false
+		if surface != .Stone {
+			src = rl.LoadImage(atlas_file(surface))
+			owned = true
+		}
+		if src.width != 0 {
+			for py in -ATLAS_PAD ..< tile_h + ATLAS_PAD {
+				for px in -ATLAS_PAD ..< tile_w + ATLAS_PAD {
+					sx := clamp(px, 0, tile_w - 1)
+					sy := clamp(py, 0, tile_h - 1)
+					color := rl.GetImageColor(src, c.int(sx), c.int(sy))
+					rl.ImageDrawPixel(&image, c.int(tile * stride_w + px + ATLAS_PAD), c.int(py + ATLAS_PAD), color)
+				}
+			}
+			ox := f32(tile * stride_w + ATLAS_PAD) / f32(stride_w * ATLAS_COUNT)
+			oy := f32(ATLAS_PAD) / f32(stride_h)
+			sx := f32(tile_w) / f32(stride_w * ATLAS_COUNT)
+			sy := f32(tile_h) / f32(stride_h)
+			renderer.atlas_tiles[tile] = {ox, oy, sx, sy}
+		}
+		if owned {
+			rl.UnloadImage(src)
+		}
+	}
+	renderer.atlas = rl.LoadTextureFromImage(image)
+	prepare_texture(&renderer.atlas)
+	renderer.atlas_shader = rl.LoadShader("assets/shaders/world.vs", "assets/shaders/world.fs")
+	if renderer.atlas_shader.id != 0 {
+		loc := rl.GetShaderLocation(renderer.atlas_shader, "tiles")
+		rl.SetShaderValueV(renderer.atlas_shader, loc, &renderer.atlas_tiles[0], .VEC4, ATLAS_COUNT)
+	}
+	renderer.atlas_material = rl.LoadMaterialDefault()
+	if renderer.atlas.id != 0 {
+		rl.SetMaterialTexture(&renderer.atlas_material, .ALBEDO, renderer.atlas)
+	}
+	if renderer.atlas_shader.id != 0 {
+		renderer.atlas_material.shader = renderer.atlas_shader
+	}
+}
+
 load_block_textures :: proc() -> Block_Textures {
 	textures := Block_Textures {
 		grass_top  = rl.LoadTexture("assets/textures/grass_block_top.png"),
@@ -907,7 +1301,7 @@ prepare_texture :: proc(texture: ^rl.Texture2D) {
 
 // SetTextureFilter turns mip sampling back on whenever a chain exists, so the
 // options screen sets the minification filter directly.
-set_block_mipmaps :: proc(textures: Block_Textures, enabled: bool) {
+set_block_mipmaps :: proc(textures: Block_Textures, atlas: rl.Texture2D, enabled: bool) {
 	// GL_NEAREST_MIPMAP_NEAREST, or GL_NEAREST when the chain should be ignored.
 	filter: c.int = 0x2700 if enabled else 0x2600
 	set :: proc(texture: rl.Texture2D, filter: c.int) {
@@ -932,6 +1326,7 @@ set_block_mipmaps :: proc(textures: Block_Textures, enabled: bool) {
 	set(textures.oak_planks, filter)
 	set(textures.workbench_top, filter)
 	set(textures.workbench_front, filter)
+	set(atlas, filter)
 }
 
 set_item_mipmaps :: proc(sprites: Item_Sprites, enabled: bool) {
