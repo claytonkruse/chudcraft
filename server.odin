@@ -35,6 +35,8 @@ Client_Input :: struct {
 	drag:          [DRAG_MAX]int,
 	// The workbench Open_Table is aimed at. Ignored by every other action.
 	table_x, table_y, table_z: int,
+	// Chunks this client keeps loaded. The options screen sets it.
+	render_distance: int,
 }
 
 Player_Command :: struct {
@@ -68,6 +70,8 @@ Server_Player :: struct {
 	// that block, not in the inventory, so closing the screen leaves them there.
 	table_open: bool,
 	table_at:   [3]int,
+	// Chunks kept loaded around this player. Set from their options screen.
+	render_distance: int,
 }
 
 Server :: struct {
@@ -95,8 +99,8 @@ server_start :: proc(seed: i64) -> Server {
 	world_gen_init(&server.gen)
 	// The column under spawn, so the first frame has ground to stand on.
 	// Everyone is born in this column; a later id that walks out of it is filled
-	// in server_join.
-	world_gen_fill_column(&server.gen, &server.world, seed, 0, 0)
+	// in server_join. The rest of the render distance follows one column a frame.
+	world_gen_ensure(&server.gen, &server.world, seed, 0, 0)
 	server.world.record = true
 	return server
 }
@@ -110,10 +114,11 @@ server_destroy :: proc(server: ^Server) {
 	delete(server.foci)
 	delete(server.drops)
 	delete(server.tables)
+	world_gen_destroy(&server.gen)
 	world_destroy(&server.world)
 }
 
-server_join :: proc(server: ^Server) -> u32 {
+server_join :: proc(server: ^Server, render_distance: int) -> u32 {
 	server.next_id += 1
 	// A step apart, so two people are not born inside one body.
 	x := SPAWN_X + int(server.next_id-1)*2
@@ -123,10 +128,11 @@ server_join :: proc(server: ^Server) -> u32 {
 	record := server.world.record
 	server.world.record = false
 	server.world.syncing = record
-	world_gen_fill_column(&server.gen, &server.world, server.seed, born.x, born.z)
+	world_gen_ensure(&server.gen, &server.world, server.seed, born.x, born.z)
 	server.world.syncing = false
 	server.world.record = record
 	player := new(Server_Player)
+	player.render_distance = render_radius(render_distance)
 	player.player = {
 		position = {f32(x), f32(surface_height(&server.world, x, SPAWN_Z)), f32(SPAWN_Z)},
 		grounded = true,
@@ -154,14 +160,14 @@ server_step :: proc(server: ^Server, commands: []Player_Command, frame_dt: f64) 
 	clear(&server.foci)
 	// Where people are standing, in blocks, so the next column is the one they
 	// are about to walk into and not merely the same chunk.
-	spots: [32][2]int
+	spots: [32]Load_Spot
 	n := 0
 	for _, player in server.players {
 		bx := block_index_horizontal(player.player.position.x)
 		bz := block_index_horizontal(player.player.position.z)
 		append(&server.foci, chunk_of(bx, 0, bz))
 		if n < len(spots) {
-			spots[n] = {bx, bz}
+			spots[n] = {x = bx, z = bz, radius = player.render_distance}
 			n += 1
 		}
 	}
@@ -170,11 +176,42 @@ server_step :: proc(server: ^Server, commands: []Player_Command, frame_dt: f64) 
 	return grow_advance(&server.world, server.foci[:], frame_dt)
 }
 
+// After a load: drop columns the players are not near, remember which columns
+// are still in memory, and make sure the ground under each player exists.
+server_settle_chunks :: proc(server: ^Server) {
+	spots: [32]Load_Spot
+	n := 0
+	for _, player in server.players {
+		if n >= len(spots) {
+			break
+		}
+		spots[n] = {
+			x = block_index_horizontal(player.player.position.x),
+			z = block_index_horizontal(player.player.position.z),
+			radius = player.render_distance,
+		}
+		n += 1
+	}
+	if n == 0 {
+		spots[0] = {radius = RENDER_DISTANCE}
+		n = 1
+	}
+	world_unload_far(&server.gen, &server.world, spots[:n])
+	for key, _ in server.world.chunks {
+		server.gen.loaded[{key.x, key.z}] = true
+	}
+	for i in 0 ..< n {
+		column := chunk_of(spots[i].x, 0, spots[i].z)
+		world_gen_ensure(&server.gen, &server.world, server.seed, column.x, column.z)
+	}
+}
+
 server_apply :: proc(server: ^Server, id: u32, input: Client_Input) {
 	player := server.players[id]
 	if player == nil {
 		return
 	}
+	player.render_distance = render_radius(input.render_distance)
 	simulate_player(&player.player, &server.world, input.move)
 	server_inventory(server, player, input)
 	if input.attack {

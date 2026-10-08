@@ -28,16 +28,37 @@ Client :: struct {
 	table_at:  [3]int,
 }
 
-client_connect :: proc(client: ^Client, server: ^Server) {
+client_connect :: proc(client: ^Client, server: ^Server, render_distance: int) {
 	client.server = server
-	client.id = server_join(server)
 	client.seed = server.seed
+	// A loaded world already has its player. A new one still has to be born.
+	if len(server.players) == 0 {
+		client.id = server_join(server, render_distance)
+	} else {
+		for id, _ in server.players {
+			client.id = id
+			break
+		}
+		if player := server.players[client.id]; player != nil {
+			player.render_distance = render_radius(render_distance)
+		}
+	}
+	if player := server.players[client.id]; player != nil {
+		bx := block_index_horizontal(player.player.position.x)
+		bz := block_index_horizontal(player.player.position.z)
+		spots := [1]Load_Spot{{
+			x = bx,
+			z = bz,
+			radius = player.render_distance,
+		}}
+		world_unload_far(&server.gen, &server.world, spots[:])
+	}
 	for key, chunk in server.world.chunks {
 		copy := new(Chunk)
 		copy.blocks = chunk.blocks
 		client.world.chunks[key] = copy
 	}
-	client_pull(client)
+	client_pull(client, render_distance)
 }
 
 client_destroy :: proc(client: ^Client) {
@@ -56,7 +77,7 @@ client_destroy :: proc(client: ^Client) {
 
 // Copies the latest server state into this view. The open inventory screen
 // stays as this client left it; that is not world state.
-client_pull :: proc(client: ^Client) {
+client_pull :: proc(client: ^Client, render_distance: int) {
 	if client.server == nil {
 		return
 	}
@@ -97,6 +118,7 @@ client_pull :: proc(client: ^Client) {
 		src.queued = false
 	}
 	clear(&client.server.world.sync_queue)
+	client_cull_chunks(client, render_distance)
 	clear(&client.drops)
 	for drop in client.server.drops {
 		append(&client.drops, Drop_View{
@@ -118,6 +140,28 @@ client_pull :: proc(client: ^Client) {
 			yaw = other.player.yaw,
 			pitch = other.player.pitch,
 		})
+	}
+}
+
+// Forgets chunks past the unload margin. The server sends a column again when
+// this player walks back into its render distance.
+client_cull_chunks :: proc(client: ^Client, render_distance: int) {
+	bx := block_index_horizontal(client.player.position.x)
+	bz := block_index_horizontal(client.player.position.z)
+	origin := chunk_of(bx, 0, bz)
+	drop: [dynamic][3]int
+	defer delete(drop)
+	limit := unload_radius(render_distance)
+	for key, _ in client.world.chunks {
+		if !column_in_radius(key.x, key.z, origin.x, origin.z, limit) {
+			append(&drop, key)
+		}
+	}
+	for key in drop {
+		chunk := client.world.chunks[key]
+		delete(chunk.pending)
+		free(chunk)
+		delete_key(&client.world.chunks, key)
 	}
 }
 

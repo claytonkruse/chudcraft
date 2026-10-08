@@ -40,6 +40,10 @@ Chunk :: struct {
 	pending: [dynamic]Deadline,
 	// In World.sync_queue. Cleared once clients have copied this chunk's blocks.
 	queued:  bool,
+	// A player or the growth sim wrote this, so unloading must keep the blocks.
+	edited:  bool,
+	// Restored from a save or an unload. Generation will not overwrite it.
+	keep:    bool,
 }
 
 // Chunks exist only where blocks do, which is what leaves the world without a build
@@ -58,6 +62,12 @@ World :: struct {
 	// column is copied once instead of one change per block.
 	syncing:    bool,
 	sync_queue: [dynamic][3]int,
+	// Chunks outside the render distance that still hold edits or deadlines.
+	cold:       map[[3]int]^Chunk,
+	// While set, generation only writes this column. A kept chunk is one that
+	// was restored, and this pass must not overwrite it.
+	gen_clip:   bool,
+	gen_x0, gen_x1, gen_z0, gen_z1: int,
 }
 
 // One cell a client should copy. The server is the only place a block changes.
@@ -71,7 +81,12 @@ world_destroy :: proc(world: ^World) {
 		delete(chunk.pending)
 		free(chunk)
 	}
+	for _, chunk in world.cold {
+		delete(chunk.pending)
+		free(chunk)
+	}
 	delete(world.chunks)
+	delete(world.cold)
 	delete(world.changes)
 	delete(world.sync_queue)
 }
@@ -121,8 +136,14 @@ set_block_at :: proc(world: ^World, x, y, z: int, block: Block, at: f64) {
 // Writes one cell and marks the meshes that show it. No growth scheduling: the
 // server does that itself, and a client copy only wants the new block.
 store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, wrote: bool) {
+	if world.gen_clip && !gen_clip_allows(world, x, z) {
+		return get_block(world, x, y, z), false
+	}
 	key := chunk_of(x, y, z)
 	chunk := world.chunks[key]
+	if chunk != nil && chunk.keep && world.gen_clip {
+		return get_block(world, x, y, z), false
+	}
 	if chunk == nil {
 		// Already air, and an empty chunk is not worth allocating.
 		if block == .Air {
@@ -159,9 +180,16 @@ store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, w
 		}
 	}
 	if world.record {
+		chunk.edited = true
 		append(&world.changes, Block_Change{x = x, y = y, z = z, block = block})
 	}
 	return old, true
+}
+
+// Inside the column being generated. Anywhere else belongs to the column that
+// writes itself, including the rest of an infinite world.
+gen_clip_allows :: proc(world: ^World, x, z: int) -> bool {
+	return x >= world.gen_x0 && x <= world.gen_x1 && z >= world.gen_z0 && z <= world.gen_z1
 }
 
 // The chunk's blocks are copied to clients at the end of the step.

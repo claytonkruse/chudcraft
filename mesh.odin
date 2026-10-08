@@ -263,6 +263,21 @@ mesh_nearer :: proc(a, b: Pending_Mesh) -> bool {
 // focus is the chunk the player is standing in. Callers that omit it mesh
 // around the origin, which is the spawn column.
 draw_world :: proc(renderer: ^Renderer, world: ^World, focus: [3]int = {0, 0, 0}) {
+	// A column that left the render distance took its blocks with it. The mesh
+	// would keep drawing that column forever if it stayed.
+	retired: [dynamic][3]int
+	defer delete(retired)
+	for key, mesh in renderer.meshes {
+		if world.chunks[key] == nil {
+			unload_chunk_mesh(mesh)
+			free(mesh)
+			append(&retired, key)
+		}
+	}
+	for key in retired {
+		delete_key(&renderer.meshes, key)
+	}
+
 	clear(&renderer.pending_meshes)
 	for key, chunk in world.chunks {
 		if !chunk.dirty && renderer.meshes[key] != nil {

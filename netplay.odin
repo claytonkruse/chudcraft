@@ -16,7 +16,7 @@ import "core:net"
 // mobile-device service, so hosting there always looks like the port is ours.
 NET_PORT        :: 43720
 NET_PORT_TRIES  :: 16
-NET_VERSION     :: u32(6)
+NET_VERSION     :: u32(7)
 NET_MAX_PLAYERS :: 8
 // A chunk message is a few kilobytes. Anything larger is a broken peer.
 NET_MAX_MESSAGE :: 8 * 1024 * 1024
@@ -53,6 +53,9 @@ Remote_Peer :: struct {
 	dead:    bool,
 	inbox:   Stream,
 	out:     Stream,
+	// Columns this peer has been sent. Cleared past the unload margin so walking
+	// back sends the column again.
+	sent:    map[[2]int]bool,
 }
 
 // The listening socket and the people who joined it. Empty unless hosting.
@@ -181,8 +184,61 @@ host_broadcast :: proc(server: ^Server) {
 				continue
 			}
 			write_chunk(&peer.out, key, chunk)
+			peer.sent[{key.x, key.z}] = true
 		}
+		send_columns_near(server, peer)
+		forget_columns_far(server, peer)
 		peer_flush(peer)
+	}
+}
+
+// Columns inside this peer's render distance that they have not been sent yet.
+send_columns_near :: proc(server: ^Server, peer: ^Remote_Peer) {
+	player := server.players[peer.id]
+	if player == nil {
+		return
+	}
+	bx := block_index_horizontal(player.player.position.x)
+	bz := block_index_horizontal(player.player.position.z)
+	origin := chunk_of(bx, 0, bz)
+	radius := render_radius(player.render_distance)
+	for key, chunk in server.world.chunks {
+		if peer.sent[{key.x, key.z}] {
+			continue
+		}
+		if !column_in_radius(key.x, key.z, origin.x, origin.z, radius) {
+			continue
+		}
+		write_chunk(&peer.out, key, chunk)
+	}
+	for dz in -radius ..= radius {
+		for dx in -radius ..= radius {
+			col := [2]int{origin.x + dx, origin.z + dz}
+			if server.gen.loaded[col] {
+				peer.sent[col] = true
+			}
+		}
+	}
+}
+
+forget_columns_far :: proc(server: ^Server, peer: ^Remote_Peer) {
+	player := server.players[peer.id]
+	if player == nil {
+		return
+	}
+	bx := block_index_horizontal(player.player.position.x)
+	bz := block_index_horizontal(player.player.position.z)
+	origin := chunk_of(bx, 0, bz)
+	limit := unload_radius(player.render_distance)
+	drop: [dynamic][2]int
+	defer delete(drop)
+	for col, _ in peer.sent {
+		if !column_in_radius(col.x, col.y, origin.x, origin.z, limit) {
+			append(&drop, col)
+		}
+	}
+	for col in drop {
+		delete_key(&peer.sent, col)
 	}
 }
 
@@ -198,7 +254,7 @@ write_chunk :: proc(out: ^Stream, key: [3]int, chunk: ^Chunk) {
 
 // Opens a connection and asks to join. The world arrives over later pumps.
 // A failure string is empty on success.
-client_dial :: proc(client: ^Client, address: string) -> string {
+client_dial :: proc(client: ^Client, address: string, render_distance: int) -> string {
 	target_buf: [96]byte
 	target := dial_target(address, target_buf[:])
 	socket, err := net.dial_tcp(target)
@@ -213,6 +269,7 @@ client_dial :: proc(client: ^Client, address: string) -> string {
 	client.link = link
 	start := message_begin(&link.out, .Join)
 	write_u32(&link.out.data, NET_VERSION)
+	append(&link.out.data, u8(render_radius(render_distance)))
 	message_end(&link.out, start)
 	peer_flush_link(link)
 	if link.failed {
@@ -235,13 +292,14 @@ client_link_close :: proc(client: ^Client) {
 }
 
 // Reads whatever has arrived. True once the world and the first snapshot are in.
-client_link_pump :: proc(client: ^Client) -> bool {
+client_link_pump :: proc(client: ^Client, render_distance: int) -> bool {
 	link := client.link
 	if link == nil || link.failed {
 		return false
 	}
 	link_recv(link)
 	link_parse(client)
+	client_cull_chunks(client, render_distance)
 	stream_compact(&link.inbox)
 	if link.failed {
 		return false
@@ -365,6 +423,7 @@ retire_peer :: proc(server: ^Server, peer: ^Remote_Peer) {
 	}
 	delete(peer.inbox.data)
 	delete(peer.out.data)
+	delete(peer.sent)
 	free(peer)
 }
 
@@ -452,6 +511,7 @@ peer_parse :: proc(server: ^Server, peer: ^Remote_Peer, commands: ^[dynamic]Play
 			}
 			reader := Reader{b = payload, ok = true}
 			version := read_u32(&reader)
+			render_distance := int(read_u8(&reader))
 			if !reader.ok || reader.i != len(payload) {
 				peer.dead = true
 				return
@@ -464,15 +524,13 @@ peer_parse :: proc(server: ^Server, peer: ^Remote_Peer, commands: ^[dynamic]Play
 				refuse(peer, .Full)
 				return
 			}
-			peer.id = server_join(server)
+			peer.id = server_join(server, render_distance)
 			start := message_begin(&peer.out, .Welcome)
 			write_u32(&peer.out.data, NET_VERSION)
 			write_u32(&peer.out.data, peer.id)
 			write_i64(&peer.out.data, server.seed)
 			message_end(&peer.out, start)
-			for key, chunk in server.world.chunks {
-				write_chunk(&peer.out, key, chunk)
-			}
+			send_columns_near(server, peer)
 			// The snapshot is the world as it stands now, including this person,
 			// so they are standing on the ground before the next frame arrives.
 			write_message(&peer.out, .Ready, server, peer)
@@ -782,6 +840,7 @@ write_input :: proc(buf: ^[dynamic]u8, input: Client_Input) {
 		write_i32(buf, i32(input.table_y))
 		write_i32(buf, i32(input.table_z))
 	}
+	append(buf, u8(render_radius(input.render_distance)))
 }
 
 read_input :: proc(reader: ^Reader) -> Client_Input {
@@ -819,6 +878,7 @@ read_input :: proc(reader: ^Reader) -> Client_Input {
 		input.table_y = int(read_i32(reader))
 		input.table_z = int(read_i32(reader))
 	}
+	input.render_distance = int(read_u8(reader))
 	return input
 }
 

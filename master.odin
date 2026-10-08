@@ -1,6 +1,7 @@
 package main
 
 import "core:c"
+import "core:fmt"
 import "core:math"
 import rl "vendor:raylib"
 import "vendor:raylib/rlgl"
@@ -33,15 +34,16 @@ main :: proc() {
 	hud_font, owned := load_hud_font()
 	defer unload_hud_font(hud_font, owned)
 
-	// The world stays unbuilt until Play, Host, or a successful join. Esc from a
-	// world comes back here, so this window can host and then join someone else.
+	// The world stays unbuilt until a saved world is opened, or a join succeeds.
+	// Esc in a world pauses it. Hosting is a button on that pause menu.
 	server: Server
 	client: Client
-	defer session_stop(&server, &client)
 	menu: Menu
 	menu_init(&menu)
+	defer delete(menu.cards)
+	defer delete(menu.servers)
+	defer session_shutdown(&server, &client, &menu)
 	front := Front.Title
-	want_host := false
 	commands: [dynamic]Player_Command
 	defer delete(commands)
 	// Closing the inventory asks the server to stow the cursor stack first.
@@ -59,10 +61,12 @@ main :: proc() {
 	defer msaa_destroy(&msaa)
 
 	options := Options {
-		mipmaps = true,
-		taa     = false,
-		msaa    = true,
+		render_distance = RENDER_DISTANCE,
+		mipmaps         = true,
+		taa             = false,
+		msaa            = true,
 	}
+	paused := false
 
 	// Previous frame's update and draw cost, with the frame limiter's wait left out.
 	work_seconds: f64
@@ -75,25 +79,25 @@ main :: proc() {
 
 		// The generating line was drawn last frame, so this hitch keeps it up.
 		if front == .Generating && menu.paint_gen {
-			if session_boot(&server, &client, want_host, &menu) {
+			if session_boot(&server, &client, &menu, options.render_distance) {
 				front = .Playing
 				rl.DisableCursor()
 				options.suppress_look = true
 			} else {
-				front = .Title
+				front = .Worlds
 				rl.EnableCursor()
 			}
 			menu.paint_gen = false
 		}
 		if front == .Connecting && menu.dial_armed && client.link == nil {
-			if reason := client_dial(&client, menu_address(&menu)); reason != "" {
+			if reason := client_dial(&client, menu_address(&menu), options.render_distance); reason != "" {
 				menu_set_status(&menu, reason)
 				front = .Join
 				menu.dial_armed = false
 			}
 		}
 		if front == .Connecting && client.link != nil {
-			if client_link_pump(&client) {
+			if client_link_pump(&client, options.render_distance) {
 				front = .Playing
 				rl.DisableCursor()
 				options.suppress_look = true
@@ -111,36 +115,96 @@ main :: proc() {
 			switch front {
 			case .Title:
 				quit = true
+			case .Worlds:
+				front = .Title
+			case .Create:
+				front = .Worlds
 			case .Join:
 				front = .Title
+			case .Server_Add:
+				front = .Join
 			case .Connecting:
 				session_stop(&server, &client)
 				front = .Join
 				menu.dial_armed = false
 				rl.EnableCursor()
 			case .Generating:
-				front = .Title
+				front = .Worlds
 				menu.paint_gen = false
 			case .Playing:
 			}
 		}
 
-		if front == .Title || front == .Join {
-			#partial switch menu_update(&menu, front) {
-			case .Play:
-				want_host = false
-				menu.paint_gen = false
+		if front == .Title || front == .Worlds || front == .Create || front == .Join || front == .Server_Add {
+			switch menu_update(&menu, front) {
+			case .None:
+			case .My_Worlds:
+				worlds_scan(&menu.cards)
+				menu.scroll = 0
 				menu_clear_status(&menu)
-				front = .Generating
-			case .Host:
-				want_host = true
-				menu.paint_gen = false
-				menu_clear_status(&menu)
-				front = .Generating
-			case .Join:
+				front = .Worlds
+			case .Join_World:
 				menu_clear_status(&menu)
 				front = .Join
+			case .New_World:
+				menu_set_name(&menu, "World")
+				menu_clear_status(&menu)
+				front = .Create
+			case .Create:
+				if menu.name_len == 0 {
+					menu_set_status(&menu, "Name the world.")
+				} else if card, ok := world_card_new(menu_world_name(&menu)); ok {
+					menu.current = card
+					menu.fresh = true
+					menu.paint_gen = false
+					menu_clear_status(&menu)
+					front = .Generating
+				} else {
+					menu_set_status(&menu, "Name the world.")
+				}
+			case .Open_World:
+				if menu.picked >= 0 && menu.picked < len(menu.cards) {
+					menu.current = menu.cards[menu.picked]
+					menu.fresh = false
+					menu.paint_gen = false
+					menu_clear_status(&menu)
+					front = .Generating
+				}
+			case .Add_Server:
+				menu_set_name(&menu, "")
+				addr: [64]byte
+				addr_text := fmt.bprintf(addr[:], "127.0.0.1:%d", NET_PORT)
+				menu_set_address(&menu, addr_text)
+				menu.focus = 0
+				menu_clear_status(&menu)
+				front = .Server_Add
+			case .Save_Server:
+				if menu.name_len == 0 {
+					menu_set_status(&menu, "Name the server.")
+				} else if menu.address_len == 0 {
+					menu_set_status(&menu, "Enter an address.")
+				} else if len(menu.servers) >= SERVERS_MAX {
+					menu_set_status(&menu, "The server list is full.")
+				} else if entry, made := server_entry_from(menu_world_name(&menu), menu_address(&menu)); made && servers_add(&menu.servers, entry) {
+					menu.scroll = 0
+					menu_clear_status(&menu)
+					front = .Join
+				} else {
+					menu_set_status(&menu, "Could not save the server list.")
+				}
+			case .Remove_Server:
+				if !servers_remove(&menu.servers, menu.picked) {
+					menu_set_status(&menu, "Could not save the server list.")
+				} else {
+					menu_clear_status(&menu)
+				}
 			case .Connect:
+				if front == .Join {
+					if menu.picked < 0 || menu.picked >= len(menu.servers) {
+						break
+					}
+					menu_set_address(&menu, server_entry_address(&menu.servers[menu.picked]))
+				}
 				if menu.address_len == 0 {
 					menu_set_status(&menu, "Enter an address.")
 				} else {
@@ -150,7 +214,13 @@ main :: proc() {
 				}
 			case .Back:
 				menu_clear_status(&menu)
-				front = .Title
+				if front == .Create {
+					front = .Worlds
+				} else if front == .Server_Add {
+					front = .Join
+				} else {
+					front = .Title
+				}
 			}
 		}
 
@@ -162,7 +232,10 @@ main :: proc() {
 		show_self := false
 		if front == .Playing {
 			want_close := false
-			if rl.IsKeyPressed(.E) && !options.open {
+			local_world := client.server != nil
+			// The click that opens Settings is not also a click on a setting.
+			options_were_open := options.open
+			if rl.IsKeyPressed(.E) && !options.open && !paused {
 				if client.inventory.open {
 					want_close = true
 				} else {
@@ -171,30 +244,80 @@ main :: proc() {
 			}
 			if rl.IsKeyPressed(.O) && !client.inventory.open {
 				options_toggle(&options)
+				// Pause keeps the cursor. Closing settings from there must not grab it.
+				if paused {
+					rl.EnableCursor()
+				}
 			}
-			if rl.IsKeyPressed(.V) {
+			if rl.IsKeyPressed(.V) && !paused {
 				client.third_person = !client.third_person
 			}
 			if rl.IsKeyPressed(.ESCAPE) {
 				if options.open {
 					options_close(&options)
+					if paused {
+						rl.EnableCursor()
+					}
 				} else if client.inventory.open {
 					want_close = true
+				} else if paused {
+					paused = false
+					options.suppress_look = true
+					rl.DisableCursor()
 				} else {
-					session_stop(&server, &client)
-					options.open = false
-					pending_close = false
-					front = .Title
+					paused = true
+					options.suppress_look = true
+					menu_clear_status(&menu)
 					rl.EnableCursor()
 				}
 			}
+			if paused && !options.open && front == .Playing {
+				#partial switch pause_click(&menu, local_world) {
+				case .Resume:
+					paused = false
+					options.suppress_look = true
+					rl.DisableCursor()
+				case .Host:
+					if server.host.listening {
+						host_shutdown(&server)
+						menu_clear_status(&menu)
+					} else if reason := host_listen(&server); reason != "" {
+						menu_set_status(&menu, reason)
+					} else {
+						menu_clear_status(&menu)
+					}
+				case .Settings:
+					if !options.open {
+						options_toggle(&options)
+					}
+				case .Leave:
+					if local_world && !world_save(&server, &menu.current, client.id) {
+						menu_set_status(&menu, "Could not save the world.")
+					} else {
+						session_stop(&server, &client)
+						paused = false
+						options.open = false
+						pending_close = false
+						menu_clear_status(&menu)
+						if local_world {
+							worlds_scan(&menu.cards)
+							front = .Worlds
+						} else {
+							front = .Title
+						}
+						rl.EnableCursor()
+					}
+				}
+			}
 			if front == .Playing {
-				options_handle_click(&options, renderer.textures, renderer.sprites, &taa)
+				if options_were_open {
+					options_handle_click(&options, renderer.textures, renderer.sprites, &taa)
+				}
 				// Right-click on a workbench opens its grid instead of placing
 				// against it. The open has to land before the look, so this frame's
 				// cursor warp is thrown away with the other screens.
 				opened_table := false
-				if !options.open && !client.inventory.open && rl.IsMouseButtonPressed(.RIGHT) {
+				if !options.open && !paused && !client.inventory.open && rl.IsMouseButtonPressed(.RIGHT) {
 					eye := camera_from_player(client.player)
 					look := eye.target - eye.position
 					thit, tx, ty, tz, _, _, _ := raycast_block(&client.world, eye.position, look, MINE_REACH)
@@ -204,7 +327,7 @@ main :: proc() {
 						opened_table = true
 					}
 				}
-				playing = !options.open && !client.inventory.open
+				playing = !options.open && !paused && !client.inventory.open
 				look_player(&client.player, playing && !options.suppress_look && !client.inventory.suppress_look)
 
 				frame_dt := f64(rl.GetFrameTime())
@@ -212,12 +335,22 @@ main :: proc() {
 				// The click that opened the table is not also a click inside it.
 				screen_open := client.inventory.open && !opened_table
 				input := client_read_input(client.player, playing, screen_open, client.inventory.table, client.inventory, &client.drag, &client.clicks, client.inventory.selected, dt)
+				// A pause freezes the body. dt of zero skips gravity for this player
+				// without stopping the world, or anyone else who is still playing.
+				if paused {
+					yaw := input.move.yaw
+					pitch := input.move.pitch
+					input = {}
+					input.move.yaw = yaw
+					input.move.pitch = pitch
+				}
 				if opened_table {
 					input.action = .Open_Table
 					input.table_x = client.table_at.x
 					input.table_y = client.table_at.y
 					input.table_z = client.table_at.z
 				}
+				input.render_distance = options.render_distance
 				if want_close {
 					input.action = .Stow
 					client.drag = {}
@@ -229,11 +362,12 @@ main :: proc() {
 					host_pump(&server, &commands)
 					grown = server_step(&server, commands[:], frame_dt)
 					host_broadcast(&server)
-					client_pull(&client)
-				} else if !client_send_input(&client, input) || !client_link_pump(&client) {
+					client_pull(&client, options.render_distance)
+				} else if !client_send_input(&client, input) || !client_link_pump(&client, options.render_distance) {
 					copy_link_reason(&menu, &client)
 					session_stop(&server, &client)
 					options.open = false
+					paused = false
 					pending_close = false
 					front = .Join
 					rl.EnableCursor()
@@ -313,6 +447,9 @@ main :: proc() {
 			draw_player_position(hud_font, client.player)
 			draw_player_direction(hud_font, client.player)
 			draw_inventory(hud_font, &renderer, client.inventory, client.drag)
+			if paused && !options.open {
+				draw_pause(hud_font, &menu, client.server != nil, server.host.listening)
+			}
 			if options.open {
 				draw_options(hud_font, options)
 			}
@@ -332,18 +469,33 @@ main :: proc() {
 	}
 }
 
-session_boot :: proc(server: ^Server, client: ^Client, host: bool, menu: ^Menu) -> bool {
-	server^ = server_start(generate_seed())
-	if host {
-		if reason := host_listen(server); reason != "" {
-			server_destroy(server)
-			server^ = {}
+session_boot :: proc(server: ^Server, client: ^Client, menu: ^Menu, render_distance: int) -> bool {
+	if menu.fresh {
+		server^ = server_start(menu.current.seed)
+	} else {
+		loaded, reason := world_load(&menu.current)
+		if reason != "" {
 			menu_set_status(menu, reason)
 			return false
 		}
+		server^ = loaded
 	}
-	client_connect(client, server)
+	client_connect(client, server, render_distance)
+	// A new world is written now, so leaving before the first save still has it.
+	if menu.fresh && !world_save(server, &menu.current, client.id) {
+		session_stop(server, client)
+		menu_set_status(menu, "Could not save the world.")
+		return false
+	}
 	return true
+}
+
+// Saves a local world on the way out of the process, then tears the session down.
+session_shutdown :: proc(server: ^Server, client: ^Client, menu: ^Menu) {
+	if client.server != nil && menu.current.path_len > 0 {
+		world_save(server, &menu.current, client.id)
+	}
+	session_stop(server, client)
 }
 
 session_stop :: proc(server: ^Server, client: ^Client) {

@@ -14,17 +14,33 @@ generate_seed :: proc() -> i64 {
 	return i64(rand.uint64())
 }
 
-// The generated region, in chunks, centered on the origin. The spawn column is
-// filled before the first frame of play; the rest follow, nearest players first.
-GROUND_CHUNKS_X :: 16
-GROUND_CHUNKS_Z :: 16
-GEN_MIN_X :: -GROUND_CHUNKS_X / 2
-GEN_MIN_Z :: -GROUND_CHUNKS_Z / 2
+// How many chunks from a player still generate and stay loaded, unless the
+// options screen says otherwise. The world has no edge; columns farther than a
+// player's distance are not built, and columns past their unload margin are
+// dropped until someone walks back.
+RENDER_DISTANCE     :: 8
+RENDER_DISTANCE_MIN :: 2
+RENDER_DISTANCE_MAX :: 16
+// Kept past the chosen distance so stepping back does not rebuild the edge.
+UNLOAD_MARGIN :: 2
 
-// How many ores or trees a frame places once the ground is in. A vein is a
-// handful of blocks and a tree is one canopy, so this stays under a column's cost.
-ORE_STEPS_PER_FRAME   :: 16
-TREE_PLACED_PER_FRAME :: 2
+// A player standing on block (x, z) who keeps `radius` chunks loaded.
+// A radius outside the allowed range means the default.
+Load_Spot :: struct {
+	x, z:   int,
+	radius: int,
+}
+
+render_radius :: proc(radius: int) -> int {
+	if radius < RENDER_DISTANCE_MIN || radius > RENDER_DISTANCE_MAX {
+		return RENDER_DISTANCE
+	}
+	return radius
+}
+
+unload_radius :: proc(radius: int) -> int {
+	return render_radius(radius) + UNLOAD_MARGIN
+}
 
 BEDROCK_DEPTH :: 2 // y 0 is always bedrock, y 1 is the jagged band.
 DIRT_DEPTH    :: 3
@@ -38,30 +54,26 @@ TERRAIN_OCTAVES   :: 4
 // only knob that decides how much water the world has.
 WATER_LEVEL :: 58
 
-// Which columns have their terrain, and how far the ore and tree passes have
-// walked. Those passes stay in their old order, so a finished world matches one
-// that was built in a single call.
+// Which columns are finished. A finished column already has its water, ore, and
+// trees; later columns do not come back and edit it. loaded is the subset
+// currently in the world, which is what the render distance keeps around.
 World_Gen :: struct {
-	terrain:      [GROUND_CHUNKS_Z][GROUND_CHUNKS_X]bool,
-	terrain_left: int,
-	ore_cx:       int,
-	ore_cz:       int,
-	ore_index:    int,
-	ore_attempt:  int,
-	ore_done:     bool,
-	tree_cx:      int,
-	tree_cz:      int,
-	tree_done:    bool,
-	done:         bool,
+	columns: map[[2]int]bool,
+	loaded:  map[[2]int]bool,
 }
 
-// Runs the stream to completion. Play does not use this; it fills the spawn
-// column and then calls world_gen_advance once per frame.
+// Fills the render distance around the origin. Play does not use this; it
+// ensures the spawn column and then calls world_gen_advance once per frame.
 generate_world :: proc(world: ^World, seed: i64) {
 	gen: World_Gen
 	world_gen_init(&gen)
-	for !gen.done {
+	defer world_gen_destroy(&gen)
+	for {
+		before := len(gen.loaded)
 		world_gen_advance(&gen, world, seed, nil, false)
+		if len(gen.loaded) == before {
+			return
+		}
 	}
 }
 
@@ -136,9 +148,6 @@ ORES := []Ore {
 	{.Gold_Ore, 2, 18, 1, 3, 6},
 }
 
-ORE_HALF_X :: GROUND_CHUNKS_X * CHUNK_SIZE / ORE_CELL / 2
-ORE_HALF_Z :: GROUND_CHUNKS_Z * CHUNK_SIZE / ORE_CELL / 2
-
 // A short random walk from a hashed start inside the ore's band.
 place_vein :: proc(world: ^World, seed: i64, ore: Ore, cx, cz: int, index, attempt: i64) {
 	h := column_hash(seed, SALT_ORE + index * 0x40 + attempt, cx, cz)
@@ -172,9 +181,6 @@ TREE_PERCENT :: 35 // Share of cells that get a tree.
 
 TRUNK_MIN :: 4
 TRUNK_MAX :: 6
-
-TREE_HALF_X :: GROUND_CHUNKS_X * CHUNK_SIZE / TREE_CELL / 2
-TREE_HALF_Z :: GROUND_CHUNKS_Z * CHUNK_SIZE / TREE_CELL / 2
 
 // Classic oak: a straight trunk with the canopy centered on its top.
 place_oak :: proc(world: ^World, x, base_y, z: int, trunk: int) {
@@ -239,19 +245,20 @@ hash_u64 :: proc(value: u64) -> u64 {
 
 world_gen_init :: proc(gen: ^World_Gen) {
 	gen^ = {}
-	gen.terrain_left = GROUND_CHUNKS_X * GROUND_CHUNKS_Z
-	gen.ore_cx = -ORE_HALF_X
-	gen.ore_cz = -ORE_HALF_Z
-	gen.tree_cx = -TREE_HALF_X
-	gen.tree_cz = -TREE_HALF_Z
 }
 
-// spots are the block columns players are standing on. An empty list keeps
-// filling outward from the origin, which is where everyone is born.
-world_gen_advance :: proc(gen: ^World_Gen, world: ^World, seed: i64, spots: [][2]int, sync: bool) {
-	if gen.done {
-		return
-	}
+world_gen_destroy :: proc(gen: ^World_Gen) {
+	delete(gen.columns)
+	delete(gen.loaded)
+	gen^ = {}
+}
+
+// spots are the block columns players are standing on, each with the render
+// distance that player asked for. An empty list keeps filling outward from the
+// origin, which is where everyone is born. One column a frame, the closest
+// missing one inside some player's distance, then anything past every unload
+// margin leaves memory.
+world_gen_advance :: proc(gen: ^World_Gen, world: ^World, seed: i64, spots: []Load_Spot, sync: bool) {
 	record := world.record
 	world.record = false
 	world.syncing = sync
@@ -260,86 +267,210 @@ world_gen_advance :: proc(gen: ^World_Gen, world: ^World, seed: i64, spots: [][2
 		world.record = record
 	}
 
-	if gen.terrain_left > 0 {
-		if cx, cz, ok := world_gen_nearest(gen, spots); ok {
-			world_gen_fill_column(gen, world, seed, cx, cz)
-		}
-	} else if !gen.ore_done {
-		// After every column, because a vein only replaces stone and has to see
-		// the dirt and grass cap that landed on it.
-		for _ in 0 ..< ORE_STEPS_PER_FRAME {
-			if gen.ore_done || !world_gen_ore_step(gen, world, seed) {
-				break
-			}
-		}
-	} else if !gen.tree_done {
-		// After the ores, and only onto grass, same as a one-shot world.
-		placed := 0
-		for _ in 0 ..< 64 {
-			if placed >= TREE_PLACED_PER_FRAME || gen.tree_done {
-				break
-			}
-			ready, did := world_gen_tree_step(gen, world, seed)
-			if !ready {
-				break
-			}
-			if did {
-				placed += 1
-			}
-		}
+	if cx, cz, ok := world_gen_nearest(gen, spots); ok {
+		world_gen_ensure(gen, world, seed, cx, cz)
 	}
-
-	gen.done = gen.terrain_left == 0 && gen.ore_done && gen.tree_done
+	world_unload_far(gen, world, spots)
 }
 
-// One 16x16 column of terrain, from bedrock to the surface. A second call is a
-// no-op, so a player born on a column that already streamed in does not rebuild it.
-world_gen_fill_column :: proc(gen: ^World_Gen, world: ^World, seed: i64, cx, cz: int) {
-	gx := cx - GEN_MIN_X
-	gz := cz - GEN_MIN_Z
-	if gx < 0 || gz < 0 || gx >= GROUND_CHUNKS_X || gz >= GROUND_CHUNKS_Z {
+// Brings one column into memory. The first visit writes terrain, water, ore, and
+// trees. A later visit puts edited chunks back and regenerates the rest, and
+// those edited chunks refuse the second write.
+world_gen_ensure :: proc(gen: ^World_Gen, world: ^World, seed: i64, cx, cz: int) {
+	column := [2]int{cx, cz}
+	if gen.loaded[column] {
 		return
 	}
-	if gen.terrain[gz][gx] {
-		return
-	}
+	world_restore_column(world, cx, cz)
+
 	x0 := cx * CHUNK_SIZE
 	z0 := cz * CHUNK_SIZE
+	world.gen_x0 = x0
+	world.gen_x1 = x0 + CHUNK_SIZE - 1
+	world.gen_z0 = z0
+	world.gen_z1 = z0 + CHUNK_SIZE - 1
+	world.gen_clip = true
+	defer world.gen_clip = false
+
 	for x in x0 ..< x0 + CHUNK_SIZE {
 		for z in z0 ..< z0 + CHUNK_SIZE {
 			generate_column(world, seed, x, z, terrain_height(seed, x, z))
 		}
 	}
-	gen.terrain[gz][gx] = true
-	gen.terrain_left -= 1
+	// Ore and trees land in this same pass, including the part of a neighbor's
+	// vein or canopy that falls here. The neighbor's own column writes the rest.
+	world_gen_ores(world, seed, cx, cz)
+	world_gen_trees(gen, world, seed, cx, cz)
+
+	gen.columns[column] = true
+	gen.loaded[column] = true
 }
 
-world_gen_nearest :: proc(gen: ^World_Gen, spots: [][2]int) -> (cx, cz: int, ok: bool) {
-	best := max(int)
-	for gz in 0 ..< GROUND_CHUNKS_Z {
-		for gx in 0 ..< GROUND_CHUNKS_X {
-			if gen.terrain[gz][gx] {
-				continue
-			}
-			wx := gx + GEN_MIN_X
-			wz := gz + GEN_MIN_Z
-			// Nobody is in the world yet: keep spreading from the spawn column.
-			d := column_distance(wx, wz, 0, 0)
-			if len(spots) > 0 {
-				d = max(int)
-				for spot in spots {
-					d = min(d, column_distance(wx, wz, spot.x, spot.y))
+// Veins start in a 16-wide cell and walk at most a dozen blocks, so only this
+// column and the eight around it can leave ore here.
+world_gen_ores :: proc(world: ^World, seed: i64, cx, cz: int) {
+	for ocx in cx - 1 ..= cx + 1 {
+		for ocz in cz - 1 ..= cz + 1 {
+			for ore, index in ORES {
+				for attempt in 0 ..< ore.veins_per_cell {
+					place_vein(world, seed, ore, ocx, ocz, i64(index), i64(attempt))
 				}
 			}
-			if !ok || d < best || (d == best && (wz < cz || (wz == cz && wx < cx))) {
-				best = d
-				cx = wx
-				cz = wz
-				ok = true
+		}
+	}
+}
+
+// Canopies reach two blocks, so a trunk just outside this column can still
+// drop leaves here. Trunks on grass are decided from the heightmap when that
+// column is not generated yet, which is the same test generate_column uses.
+world_gen_trees :: proc(gen: ^World_Gen, world: ^World, seed: i64, cx, cz: int) {
+	x0 := cx * CHUNK_SIZE
+	z0 := cz * CHUNK_SIZE
+	x1 := x0 + CHUNK_SIZE - 1
+	z1 := z0 + CHUNK_SIZE - 1
+	for tcx in tree_cell(x0 - 2) ..= tree_cell(x1 + 2) {
+		for tcz in tree_cell(z0 - 2) ..= tree_cell(z1 + 2) {
+			h := column_hash(seed, SALT_TREE, tcx, tcz)
+			if h % 100 >= TREE_PERCENT {
+				continue
+			}
+			x := tcx * TREE_CELL + int((h >> 8) % TREE_CELL)
+			z := tcz * TREE_CELL + int((h >> 16) % TREE_CELL)
+			if x+2 < x0 || x-2 > x1 || z+2 < z0 || z-2 > z1 {
+				continue
+			}
+			if !tree_on_grass(gen, world, seed, x, z, cx, cz) {
+				continue
+			}
+			trunk := TRUNK_MIN + int((h >> 24) % (TRUNK_MAX - TRUNK_MIN + 1))
+			place_oak(world, x, terrain_height(seed, x, z), z, trunk)
+		}
+	}
+}
+
+tree_on_grass :: proc(gen: ^World_Gen, world: ^World, seed: i64, x, z, cx, cz: int) -> bool {
+	origin := chunk_of(x, 0, z)
+	if (origin.x == cx && origin.z == cz) || column_done(gen, origin.x, origin.z) {
+		return get_block(world, x, terrain_height(seed, x, z)-1, z) == .Grass
+	}
+	return terrain_height(seed, x, z) >= WATER_LEVEL
+}
+
+column_done :: proc(gen: ^World_Gen, cx, cz: int) -> bool {
+	return gen.columns[{cx, cz}]
+}
+
+// True when this column is inside the square of `radius` chunks around origin.
+column_in_radius :: proc(cx, cz, ox, oz, radius: int) -> bool {
+	dx := cx - ox
+	dz := cz - oz
+	if dx < 0 {
+		dx = -dx
+	}
+	if dz < 0 {
+		dz = -dz
+	}
+	return dx <= radius && dz <= radius
+}
+
+// Tree cells are TREE_CELL wide and numbered so cell 0 starts at block 0.
+// Negative blocks belong to negative cells, unlike a truncating divide.
+tree_cell :: proc(block: int) -> int {
+	if block >= 0 {
+		return block / TREE_CELL
+	}
+	return (block - (TREE_CELL - 1)) / TREE_CELL
+}
+
+world_gen_nearest :: proc(gen: ^World_Gen, spots: []Load_Spot) -> (cx, cz: int, ok: bool) {
+	best := max(int)
+	origins := spots
+	fallback := [1]Load_Spot{{0, 0, RENDER_DISTANCE}}
+	if len(origins) == 0 {
+		origins = fallback[:]
+	}
+	for spot in origins {
+		origin := chunk_of(spot.x, 0, spot.z)
+		radius := render_radius(spot.radius)
+		for dz in -radius ..= radius {
+			for dx in -radius ..= radius {
+				wx := origin.x + dx
+				wz := origin.z + dz
+				if gen.loaded[{wx, wz}] {
+					continue
+				}
+				d := column_distance(wx, wz, spot.x, spot.z)
+				if !ok || d < best || (d == best && (wz < cz || (wz == cz && wx < cx))) {
+					best = d
+					cx = wx
+					cz = wz
+					ok = true
+				}
 			}
 		}
 	}
 	return
+}
+
+// Edited chunks wait here. A pristine column is regenerated from the seed, so
+// it does not need a copy.
+world_restore_column :: proc(world: ^World, cx, cz: int) {
+	keys: [dynamic][3]int
+	defer delete(keys)
+	for key, _ in world.cold {
+		if key.x == cx && key.z == cz {
+			append(&keys, key)
+		}
+	}
+	for key in keys {
+		chunk := world.cold[key]
+		chunk.keep = true
+		chunk.dirty = true
+		world.chunks[key] = chunk
+		if world.syncing {
+			note_sync(world, key, chunk)
+		}
+		delete_key(&world.cold, key)
+	}
+}
+
+// Drops columns no player is near. Edits and pending growth are kept so walking
+// back does not wipe them; everything else is rebuilt from the seed.
+world_unload_far :: proc(gen: ^World_Gen, world: ^World, spots: []Load_Spot) {
+	origins := spots
+	fallback := [1]Load_Spot{{0, 0, RENDER_DISTANCE}}
+	if len(origins) == 0 {
+		origins = fallback[:]
+	}
+	keys: [dynamic][3]int
+	defer delete(keys)
+	for key, _ in world.chunks {
+		near := false
+		for spot in origins {
+			origin := chunk_of(spot.x, 0, spot.z)
+			if column_in_radius(key.x, key.z, origin.x, origin.z, unload_radius(spot.radius)) {
+				near = true
+				break
+			}
+		}
+		if !near {
+			append(&keys, key)
+		}
+	}
+	for key in keys {
+		chunk := world.chunks[key]
+		delete_key(&world.chunks, key)
+		delete_key(&gen.loaded, [2]int{key.x, key.z})
+		if chunk.queued {
+			chunk.queued = false
+		}
+		if chunk.edited || len(chunk.pending) > 0 {
+			world.cold[key] = chunk
+		} else {
+			delete(chunk.pending)
+			free(chunk)
+		}
+	}
 }
 
 // Blocks from the standing spot to the nearest cell of this column. Zero when
@@ -362,108 +493,4 @@ column_distance :: proc(cx, cz, bx, bz: int) -> int {
 		dz = bz - z1
 	}
 	return dx * dx + dz * dz
-}
-
-// True when every in-region column under this block rectangle has terrain.
-// Columns outside the map are air on purpose, and a vein or canopy may poke
-// into them the same way a one-shot world did.
-blocks_ready :: proc(gen: ^World_Gen, x0, z0, x1, z1: int) -> bool {
-	c0 := chunk_of(x0, 0, z0)
-	c1 := chunk_of(x1, 0, z1)
-	for cz in c0.z ..= c1.z {
-		for cx in c0.x ..= c1.x {
-			gx := cx - GEN_MIN_X
-			gz := cz - GEN_MIN_Z
-			if gx < 0 || gz < 0 || gx >= GROUND_CHUNKS_X || gz >= GROUND_CHUNKS_Z {
-				continue
-			}
-			if !gen.terrain[gz][gx] {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// One vein, in the same cell order as a one-shot pass. False means the stone
-// it might replace is not all generated yet, and the cursor stays put.
-world_gen_ore_step :: proc(gen: ^World_Gen, world: ^World, seed: i64) -> bool {
-	if gen.ore_done {
-		return false
-	}
-	ore := ORES[gen.ore_index]
-	x0 := gen.ore_cx * ORE_CELL - ore.max_size
-	x1 := (gen.ore_cx + 1) * ORE_CELL - 1 + ore.max_size
-	z0 := gen.ore_cz * ORE_CELL - ore.max_size
-	z1 := (gen.ore_cz + 1) * ORE_CELL - 1 + ore.max_size
-	if !blocks_ready(gen, x0, z0, x1, z1) {
-		return false
-	}
-	place_vein(world, seed, ore, gen.ore_cx, gen.ore_cz, i64(gen.ore_index), i64(gen.ore_attempt))
-	gen.ore_attempt += 1
-	if gen.ore_attempt < ore.veins_per_cell {
-		return true
-	}
-	gen.ore_attempt = 0
-	gen.ore_index += 1
-	if gen.ore_index < len(ORES) {
-		return true
-	}
-	gen.ore_index = 0
-	gen.ore_cz += 1
-	if gen.ore_cz < ORE_HALF_Z {
-		return true
-	}
-	gen.ore_cz = -ORE_HALF_Z
-	gen.ore_cx += 1
-	if gen.ore_cx >= ORE_HALF_X {
-		gen.ore_done = true
-	}
-	return true
-}
-
-// One tree cell. ready is false when this tree's canopy would land on ground
-// that does not exist yet; the cell is left for a later frame. Rejected cells
-// still advance, because they write nothing and must not hold up the ones after.
-world_gen_tree_step :: proc(gen: ^World_Gen, world: ^World, seed: i64) -> (ready, placed: bool) {
-	if gen.tree_done {
-		return true, false
-	}
-	cx := gen.tree_cx
-	cz := gen.tree_cz
-	h := column_hash(seed, SALT_TREE, cx, cz)
-	if h % 100 >= TREE_PERCENT {
-		world_gen_tree_advance(gen)
-		return true, false
-	}
-
-	x := cx * TREE_CELL + int((h >> 8) % TREE_CELL)
-	z := cz * TREE_CELL + int((h >> 16) % TREE_CELL)
-	// Canopy radius is 2. The trunk sits inside that footprint.
-	if !blocks_ready(gen, x - 2, z - 2, x + 2, z + 2) {
-		return false, false
-	}
-
-	ground := terrain_height(seed, x, z)
-	// Grass is the one test that keeps trees out of lakes and off bare stone,
-	// because a flooded column is capped with dirt instead.
-	if get_block(world, x, ground - 1, z) == .Grass {
-		trunk := TRUNK_MIN + int((h >> 24) % (TRUNK_MAX - TRUNK_MIN + 1))
-		place_oak(world, x, ground, z, trunk)
-		placed = true
-	}
-	world_gen_tree_advance(gen)
-	return true, placed
-}
-
-world_gen_tree_advance :: proc(gen: ^World_Gen) {
-	gen.tree_cz += 1
-	if gen.tree_cz < TREE_HALF_Z {
-		return
-	}
-	gen.tree_cz = -TREE_HALF_Z
-	gen.tree_cx += 1
-	if gen.tree_cx >= TREE_HALF_X {
-		gen.tree_done = true
-	}
 }
