@@ -8,15 +8,15 @@ import "core:net"
 // speaks the same inputs the local client already produces. Block changes,
 // drops, and where everyone is standing go back the other way.
 //
-// The world is sent once, as the chunks that exist at the moment of joining.
-// After that only the cells that change travel, which is the list the server
-// already records for its own client.
+// Chunks that exist at the moment of joining are sent then. Columns that stream
+// in afterwards are sent whole, and the cells that change during play are the
+// list the server already records for its own client.
 
 // 27015 is already taken on a lot of Windows machines, by Steam and by Apple's
 // mobile-device service, so hosting there always looks like the port is ours.
 NET_PORT        :: 43720
 NET_PORT_TRIES  :: 16
-NET_VERSION     :: u32(2)
+NET_VERSION     :: u32(6)
 NET_MAX_PLAYERS :: 8
 // A chunk message is a few kilobytes. Anything larger is a broken peer.
 NET_MAX_MESSAGE :: 8 * 1024 * 1024
@@ -172,9 +172,28 @@ host_broadcast :: proc(server: ^Server) {
 		if peer.dead || !peer.playing {
 			continue
 		}
+		// Edits first, then any column that streamed in this step, so the chunk
+		// wins where it also contains those edits.
 		write_message(&peer.out, .State, server, peer)
+		for key in server.world.sync_queue {
+			chunk := server.world.chunks[key]
+			if chunk == nil {
+				continue
+			}
+			write_chunk(&peer.out, key, chunk)
+		}
 		peer_flush(peer)
 	}
+}
+
+write_chunk :: proc(out: ^Stream, key: [3]int, chunk: ^Chunk) {
+	start := message_begin(out, .Chunk)
+	write_i32(&out.data, i32(key.x))
+	write_i32(&out.data, i32(key.y))
+	write_i32(&out.data, i32(key.z))
+	bytes := mem.slice_ptr(([^]u8)(&chunk.blocks), size_of(chunk.blocks))
+	append(&out.data, ..bytes)
+	message_end(out, start)
 }
 
 // Opens a connection and asks to join. The world arrives over later pumps.
@@ -452,13 +471,7 @@ peer_parse :: proc(server: ^Server, peer: ^Remote_Peer, commands: ^[dynamic]Play
 			write_i64(&peer.out.data, server.seed)
 			message_end(&peer.out, start)
 			for key, chunk in server.world.chunks {
-				start = message_begin(&peer.out, .Chunk)
-				write_i32(&peer.out.data, i32(key.x))
-				write_i32(&peer.out.data, i32(key.y))
-				write_i32(&peer.out.data, i32(key.z))
-				bytes := mem.slice_ptr(([^]u8)(&chunk.blocks), size_of(chunk.blocks))
-				append(&peer.out.data, ..bytes)
-				message_end(&peer.out, start)
+				write_chunk(&peer.out, key, chunk)
 			}
 			// The snapshot is the world as it stands now, including this person,
 			// so they are standing on the ground before the next frame arrives.
@@ -593,12 +606,27 @@ apply_state :: proc(client: ^Client, payload: []u8) -> bool {
 	for i in 0 ..< CRAFT2_N {
 		client.inventory.craft2[i] = read_slot(&reader)
 	}
-	for i in 0 ..< CRAFT3_N {
-		client.inventory.craft3[i] = read_slot(&reader)
-	}
 	client.inventory.open = open
 	client.inventory.suppress_look = suppress
 	client.inventory.table = table
+
+	tables := int(read_u32(&reader))
+	if !reader.ok || tables < 0 || tables > 100000 {
+		return false
+	}
+	delete(client.tables)
+	client.tables = nil
+	for _ in 0 ..< tables {
+		at := [3]int{int(read_i32(&reader)), int(read_i32(&reader)), int(read_i32(&reader))}
+		grid: [CRAFT3_N]Slot
+		for i in 0 ..< CRAFT3_N {
+			grid[i] = read_slot(&reader)
+		}
+		if reader.ok {
+			client.tables[at] = grid
+		}
+	}
+	apply_open_table(client)
 
 	others := int(read_u32(&reader))
 	if !reader.ok || others < 0 || others > NET_MAX_PLAYERS {
@@ -672,8 +700,14 @@ write_state :: proc(buf: ^[dynamic]u8, server: ^Server, self: u32) {
 	for slot in player.inventory.craft2 {
 		write_slot(buf, slot)
 	}
-	for slot in player.inventory.craft3 {
-		write_slot(buf, slot)
+	write_u32(buf, u32(len(server.tables)))
+	for at, grid in server.tables {
+		write_i32(buf, i32(at.x))
+		write_i32(buf, i32(at.y))
+		write_i32(buf, i32(at.z))
+		for slot in grid {
+			write_slot(buf, slot)
+		}
 	}
 
 		others := 0
@@ -730,6 +764,24 @@ write_input :: proc(buf: ^[dynamic]u8, input: Client_Input) {
 	append(buf, flags)
 	append(buf, u8(input.action))
 	write_i32(buf, i32(input.slot))
+	if input.action == .Drag_Left || input.action == .Drag_Right {
+		n := input.drag_n
+		if n < 0 {
+			n = 0
+		}
+		if n > DRAG_MAX {
+			n = DRAG_MAX
+		}
+		append(buf, u8(n))
+		for i in 0 ..< n {
+			write_i32(buf, i32(input.drag[i]))
+		}
+	}
+	if input.action == .Open_Table {
+		write_i32(buf, i32(input.table_x))
+		write_i32(buf, i32(input.table_y))
+		write_i32(buf, i32(input.table_z))
+	}
 }
 
 read_input :: proc(reader: ^Reader) -> Client_Input {
@@ -746,11 +798,27 @@ read_input :: proc(reader: ^Reader) -> Client_Input {
 	input.attack = flags & 32 != 0
 	input.use = flags & 64 != 0
 	action := read_u8(reader)
-	if action > u8(Inventory_Action.Drop_All) {
+	if action > u8(Inventory_Action.Open_Table) {
 		reader.ok = false
 	}
 	input.action = Inventory_Action(action)
 	input.slot = int(read_i32(reader))
+	if input.action == .Drag_Left || input.action == .Drag_Right {
+		n := int(read_u8(reader))
+		if n > DRAG_MAX {
+			reader.ok = false
+			return input
+		}
+		input.drag_n = n
+		for i in 0 ..< n {
+			input.drag[i] = int(read_i32(reader))
+		}
+	}
+	if input.action == .Open_Table {
+		input.table_x = int(read_i32(reader))
+		input.table_y = int(read_i32(reader))
+		input.table_z = int(read_i32(reader))
+	}
 	return input
 }
 
@@ -783,7 +851,7 @@ read_item :: proc(reader: ^Reader) -> Item {
 	if kind != .Block {
 		return {kind = kind}
 	}
-	if block_raw > u8(Block.Crafting_Table) {
+	if block_raw > u8(Block.Workbench) {
 		reader.ok = false
 		return {}
 	}
@@ -792,7 +860,7 @@ read_item :: proc(reader: ^Reader) -> Item {
 
 read_block :: proc(reader: ^Reader) -> Block {
 	raw := read_u8(reader)
-	if raw > u8(Block.Crafting_Table) {
+	if raw > u8(Block.Workbench) {
 		reader.ok = false
 		return .Air
 	}

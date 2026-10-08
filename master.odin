@@ -190,7 +190,7 @@ main :: proc() {
 			}
 			if front == .Playing {
 				options_handle_click(&options, renderer.textures, renderer.sprites, &taa)
-				// Right-click on a crafting table opens its grid instead of placing
+				// Right-click on a workbench opens its grid instead of placing
 				// against it. The open has to land before the look, so this frame's
 				// cursor warp is thrown away with the other screens.
 				opened_table := false
@@ -198,8 +198,9 @@ main :: proc() {
 					eye := camera_from_player(client.player)
 					look := eye.target - eye.position
 					thit, tx, ty, tz, _, _, _ := raycast_block(&client.world, eye.position, look, MINE_REACH)
-					if thit && get_block(&client.world, tx, ty, tz) == .Crafting_Table {
+					if thit && get_block(&client.world, tx, ty, tz) == .Workbench {
 						inventory_open_table(&client.inventory)
+						client.table_at = {tx, ty, tz}
 						opened_table = true
 					}
 				}
@@ -210,9 +211,16 @@ main :: proc() {
 				dt := min(f32(frame_dt), 0.05)
 				// The click that opened the table is not also a click inside it.
 				screen_open := client.inventory.open && !opened_table
-				input := client_read_input(client.player, playing, screen_open, client.inventory.table, client.inventory.selected, dt)
+				input := client_read_input(client.player, playing, screen_open, client.inventory.table, client.inventory, &client.drag, &client.clicks, client.inventory.selected, dt)
+				if opened_table {
+					input.action = .Open_Table
+					input.table_x = client.table_at.x
+					input.table_y = client.table_at.y
+					input.table_z = client.table_at.z
+				}
 				if want_close {
 					input.action = .Stow
+					client.drag = {}
 					pending_close = true
 				}
 				if client.server != nil {
@@ -262,7 +270,14 @@ main :: proc() {
 			// stays on the backbuffer, after the resolve, so the crosshair and text
 			// are not blended across frames.
 			taa_begin(&taa, &msaa, camera, options.taa, options.msaa)
-			draw_world(&renderer, &client.world)
+			feet := client.player.position
+			focus := chunk_of(
+				block_index_horizontal(feet.x),
+				block_index_vertical(feet.y),
+				block_index_horizontal(feet.z),
+			)
+			draw_world(&renderer, &client.world, focus)
+			draw_table_items(&renderer, &client.world, client.tables)
 			draw_drops(&renderer, client.drops[:], .Opaque)
 			draw_drops(&renderer, client.drops[:], .Cutout)
 			draw_remote_players(&renderer, client.others[:])
@@ -297,7 +312,7 @@ main :: proc() {
 			}
 			draw_player_position(hud_font, client.player)
 			draw_player_direction(hud_font, client.player)
-			draw_inventory(hud_font, &renderer, client.inventory)
+			draw_inventory(hud_font, &renderer, client.inventory, client.drag)
 			if options.open {
 				draw_options(hud_font, options)
 			}

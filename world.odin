@@ -16,7 +16,7 @@ Block :: enum u8 {
 	Oak_Log,
 	Oak_Leaves,
 	Oak_Planks,
-	Crafting_Table,
+	Workbench,
 }
 
 // A power of two, so splitting a world coordinate is a shift and a mask.
@@ -38,6 +38,8 @@ Chunk :: struct {
 	// A check stops at the first date that is not due. Absent while the chunk is
 	// unloaded; the date is what lets the change happen anyway.
 	pending: [dynamic]Deadline,
+	// In World.sync_queue. Cleared once clients have copied this chunk's blocks.
+	queued:  bool,
 }
 
 // Chunks exist only where blocks do, which is what leaves the world without a build
@@ -52,6 +54,10 @@ World :: struct {
 	// server turns it on so only play is replicated.
 	record:  bool,
 	changes: [dynamic]Block_Change,
+	// Generation sets this and appends each touched chunk to sync_queue, so a
+	// column is copied once instead of one change per block.
+	syncing:    bool,
+	sync_queue: [dynamic][3]int,
 }
 
 // One cell a client should copy. The server is the only place a block changes.
@@ -67,6 +73,7 @@ world_destroy :: proc(world: ^World) {
 	}
 	delete(world.chunks)
 	delete(world.changes)
+	delete(world.sync_queue)
 }
 
 // A shift floors toward negative infinity. Odin's `/` truncates toward zero, which
@@ -132,6 +139,9 @@ store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, w
 	}
 	chunk.blocks[l.x][l.y][l.z] = block
 	chunk.dirty = true
+	if world.syncing {
+		note_sync(world, key, chunk)
+	}
 
 	// A block on a border decides which faces the chunk across that border draws,
 	// so that chunk has to be rebuilt too.
@@ -143,12 +153,24 @@ store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, w
 		neighbor[axis] += -1 if l[axis] == 0 else 1
 		if adjacent, ok := world.chunks[neighbor]; ok {
 			adjacent.dirty = true
+			if world.syncing {
+				note_sync(world, neighbor, adjacent)
+			}
 		}
 	}
 	if world.record {
 		append(&world.changes, Block_Change{x = x, y = y, z = z, block = block})
 	}
 	return old, true
+}
+
+// The chunk's blocks are copied to clients at the end of the step.
+note_sync :: proc(world: ^World, key: [3]int, chunk: ^Chunk) {
+	if chunk.queued {
+		return
+	}
+	chunk.queued = true
+	append(&world.sync_queue, key)
 }
 
 // Whether a block stops the player, which is also what the break ray stops on.

@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:math"
+import "core:slice"
 import rl "vendor:raylib"
 import "vendor:raylib/rlgl"
 
@@ -21,8 +22,8 @@ Surface :: enum {
 	Oak_Log_Side,
 	Oak_Leaves,
 	Oak_Planks,
-	Crafting_Top,
-	Crafting_Front,
+	Workbench_Top,
+	Workbench_Front,
 }
 
 // Which draw pass a surface belongs to. Cutout keeps depth writes on and throws away
@@ -107,8 +108,8 @@ Block_Textures :: struct {
 	oak_log_side: rl.Texture2D,
 	oak_leaves:   rl.Texture2D,
 	oak_planks:   rl.Texture2D,
-	crafting_top:   rl.Texture2D,
-	crafting_front: rl.Texture2D,
+	workbench_top:   rl.Texture2D,
+	workbench_front: rl.Texture2D,
 }
 
 // Flat pictures for sticks and tools. Blocks keep the cube icons.
@@ -154,6 +155,9 @@ Renderer :: struct {
 	item_quad: rl.Mesh,
 	item_material: rl.Material,
 	player:    Player_Model,
+	// Dirty chunks, nearest the player first. A frame meshes the ground underfoot
+	// and leaves the rest of a newly loaded column for the frames after.
+	pending_meshes: [dynamic]Pending_Mesh,
 }
 
 renderer_init :: proc() -> Renderer {
@@ -193,6 +197,7 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 		free(mesh)
 	}
 	delete(renderer.meshes)
+	delete(renderer.pending_meshes)
 	for block in Block {
 		unload_chunk_mesh(&renderer.item_meshes[block])
 	}
@@ -237,22 +242,52 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 	player_model_destroy(&renderer.player)
 }
 
-// Rebuilds whatever is dirty, then draws the depth-writing passes.
+// How many chunk meshes a frame will build. The column under the player is a
+// handful of these, so the ground is visible on the frame it loads and the
+// rest of the world catches up over the frames after.
+MESH_PER_FRAME :: 8
+
+Pending_Mesh :: struct {
+	key:  [3]int,
+	dist: int,
+}
+
+mesh_nearer :: proc(a, b: Pending_Mesh) -> bool {
+	return a.dist < b.dist
+}
+
+// Rebuilds the dirty chunks closest to focus, then draws the depth-writing passes.
 // Water is draw_water, and it has to come after players and drops. Those write
 // depth; water does not, so anything drawn after it composites in front of the
 // surface even when it is standing behind it.
-draw_world :: proc(renderer: ^Renderer, world: ^World) {
+// focus is the chunk the player is standing in. Callers that omit it mesh
+// around the origin, which is the spawn column.
+draw_world :: proc(renderer: ^Renderer, world: ^World, focus: [3]int = {0, 0, 0}) {
+	clear(&renderer.pending_meshes)
 	for key, chunk in world.chunks {
+		if !chunk.dirty && renderer.meshes[key] != nil {
+			continue
+		}
+		dx := key.x - focus.x
+		dy := key.y - focus.y
+		dz := key.z - focus.z
+		append(&renderer.pending_meshes, Pending_Mesh{key, dx * dx + dy * dy + dz * dz})
+	}
+	slice.sort_by(renderer.pending_meshes[:], mesh_nearer)
+	n := min(len(renderer.pending_meshes), MESH_PER_FRAME)
+	for i in 0 ..< n {
+		key := renderer.pending_meshes[i].key
+		chunk := world.chunks[key]
+		if chunk == nil {
+			continue
+		}
 		mesh := renderer.meshes[key]
 		if mesh == nil {
 			mesh = new(Chunk_Mesh)
 			renderer.meshes[key] = mesh
-			chunk.dirty = true
 		}
-		if chunk.dirty {
-			build_chunk_mesh(renderer, world, key, mesh)
-			chunk.dirty = false
-		}
+		build_chunk_mesh(renderer, world, key, mesh)
+		chunk.dirty = false
 	}
 
 	// Depth-writing passes first, so the depth buffer is complete before anything blends.
@@ -570,6 +605,55 @@ item_sprite :: proc(sprites: Item_Sprites, item: Item) -> rl.Texture2D {
 	return {}
 }
 
+// Centers of the nine squares painted on the workbench's top, in texture
+// space. The picture's top row is the block's -Z side, matching the face UVs.
+TABLE_CELL :: [3]f32{9.0 / 32.0, 16.0 / 32.0, 23.0 / 32.0}
+
+// Sits inside one of those squares, just above the face so it does not z-fight.
+TABLE_ICON :: f32(0.15)
+
+// The items arranged on a workbench, drawn in the 3x3 on its top face.
+draw_table_items :: proc(renderer: ^Renderer, world: ^World, tables: map[[3]int][CRAFT3_N]Slot) {
+	if len(tables) == 0 || renderer.item_quad.vertexCount == 0 {
+		return
+	}
+	flat := rl.MatrixRotateX(-math.PI * 0.5)
+	cell := TABLE_CELL
+	// The quad faces +Z. Laying it flat turns that winding away from the sky.
+	rlgl.DisableBackfaceCulling()
+	defer rlgl.EnableBackfaceCulling()
+	for at, grid in tables {
+		if get_block(world, at.x, at.y, at.z) != .Workbench {
+			continue
+		}
+		for i in 0 ..< CRAFT3_N {
+			slot := grid[i]
+			if slot.count <= 0 || item_empty(slot.item) {
+				continue
+			}
+			col := i % 3
+			row := i / 3
+			place := rl.MatrixTranslate(
+				f32(at.x) - 0.5 + cell[col],
+				f32(at.y) + 1 + 0.02,
+				f32(at.z) - 0.5 + cell[row],
+			)
+			size := rl.MatrixScale(TABLE_ICON, TABLE_ICON, TABLE_ICON)
+			transform := place * flat * size
+			if slot.item.kind == .Block {
+				icon := renderer.icons[slot.item.block]
+				if icon.id == 0 {
+					continue
+				}
+				rl.SetMaterialTexture(&renderer.item_material, .ALBEDO, icon.texture)
+				rl.DrawMesh(renderer.item_quad, renderer.item_material, transform)
+			} else {
+				draw_item_sprite(renderer, slot.item, transform)
+			}
+		}
+	}
+}
+
 draw_item_sprite :: proc(renderer: ^Renderer, item: Item, transform: rl.Matrix) {
 	tex := item_sprite(renderer.sprites, item)
 	if tex.id == 0 || renderer.item_quad.vertexCount == 0 {
@@ -637,14 +721,14 @@ block_surface :: proc(block: Block, face: Face) -> Surface {
 		return .Oak_Leaves
 	case .Oak_Planks:
 		return .Oak_Planks
-	case .Crafting_Table:
+	case .Workbench:
 		switch face {
 		case .Pos_Y:
-			return .Crafting_Top
+			return .Workbench_Top
 		case .Neg_Y:
 			return .Oak_Planks
 		case .Pos_X, .Neg_X, .Pos_Z, .Neg_Z:
-			return .Crafting_Front
+			return .Workbench_Front
 		}
 	case .Stone, .Air:
 		return .Stone
@@ -680,10 +764,10 @@ surface_texture :: proc(textures: Block_Textures, surface: Surface) -> rl.Textur
 		return textures.oak_leaves
 	case .Oak_Planks:
 		return textures.oak_planks
-	case .Crafting_Top:
-		return textures.crafting_top
-	case .Crafting_Front:
-		return textures.crafting_front
+	case .Workbench_Top:
+		return textures.workbench_top
+	case .Workbench_Front:
+		return textures.workbench_front
 	}
 	return {}
 }
@@ -724,9 +808,9 @@ surface_tint :: proc(surface: Surface, textured: bool) -> [4]u8 {
 		return {103, 82, 49, 255}
 	case .Oak_Planks:
 		return {168, 134, 80, 255}
-	case .Crafting_Top:
+	case .Workbench_Top:
 		return {140, 110, 65, 255}
-	case .Crafting_Front:
+	case .Workbench_Front:
 		return {122, 96, 56, 255}
 	}
 	return WHITE_TINT
@@ -748,8 +832,8 @@ load_block_textures :: proc() -> Block_Textures {
 		oak_log_side = rl.LoadTexture("assets/textures/oak_log.png"),
 		oak_leaves   = rl.LoadTexture("assets/textures/oak_leaves.png"),
 		oak_planks     = rl.LoadTexture("assets/textures/oak_planks.png"),
-		crafting_top   = rl.LoadTexture("assets/textures/crafting_table_top.png"),
-		crafting_front = rl.LoadTexture("assets/textures/crafting_table_front.png"),
+		workbench_top   = rl.LoadTexture("assets/textures/workbench_top.png"),
+		workbench_front = rl.LoadTexture("assets/textures/workbench_front.png"),
 	}
 	prepare_texture(&textures.grass_top)
 	prepare_texture(&textures.grass_side)
@@ -764,8 +848,8 @@ load_block_textures :: proc() -> Block_Textures {
 	prepare_texture(&textures.oak_log_side)
 	prepare_texture(&textures.oak_leaves)
 	prepare_texture(&textures.oak_planks)
-	prepare_texture(&textures.crafting_top)
-	prepare_texture(&textures.crafting_front)
+	prepare_texture(&textures.workbench_top)
+	prepare_texture(&textures.workbench_front)
 	return textures
 }
 
@@ -831,8 +915,8 @@ set_block_mipmaps :: proc(textures: Block_Textures, enabled: bool) {
 	set(textures.oak_log_side, filter)
 	set(textures.oak_leaves, filter)
 	set(textures.oak_planks, filter)
-	set(textures.crafting_top, filter)
-	set(textures.crafting_front, filter)
+	set(textures.workbench_top, filter)
+	set(textures.workbench_front, filter)
 }
 
 set_item_mipmaps :: proc(sprites: Item_Sprites, enabled: bool) {

@@ -90,8 +90,8 @@ block_name :: proc(block: Block) -> cstring {
 		return "Oak Leaves"
 	case .Oak_Planks:
 		return "Oak Planks"
-	case .Crafting_Table:
-		return "Crafting Table"
+	case .Workbench:
+		return "Workbench"
 	case .Air:
 		return ""
 	}
@@ -100,7 +100,7 @@ block_name :: proc(block: Block) -> cstring {
 
 // A shaped recipe. The pattern's bounding box is what has to match, so a stick
 // column can sit in any column of the grid. Tools are three tall and only fit
-// the crafting table. Stone tools use stone blocks; this world has no cobblestone.
+// the workbench. Stone tools use stone blocks; this world has no cobblestone.
 Recipe :: struct {
 	w, h:  int,
 	cells: [9]Item,
@@ -123,15 +123,15 @@ ROCK :: Item {
 STICK_ITEM :: Item {
 	kind = .Stick,
 }
-TABLE_ITEM :: Item {
+WORKBENCH :: Item {
 	kind  = .Block,
-	block = .Crafting_Table,
+	block = .Workbench,
 }
 
 RECIPES :: [?]Recipe {
 	{w = 1, h = 1, cells = {0 = LOG}, out = PLANK, count = 4},
 	{w = 1, h = 2, cells = {0 = PLANK, 1 = PLANK}, out = STICK_ITEM, count = 4},
-	{w = 2, h = 2, cells = {0 = PLANK, 1 = PLANK, 2 = PLANK, 3 = PLANK}, out = TABLE_ITEM, count = 1},
+	{w = 2, h = 2, cells = {0 = PLANK, 1 = PLANK, 2 = PLANK, 3 = PLANK}, out = WORKBENCH, count = 1},
 	{w = 1, h = 3, cells = {0 = PLANK, 1 = STICK_ITEM, 2 = STICK_ITEM}, out = {kind = .Wood_Shovel}, count = 1},
 	{
 		w = 3, h = 3,
@@ -147,7 +147,7 @@ RECIPES :: [?]Recipe {
 }
 
 // The ingredients currently arranged in a square grid, row-major.
-// width is 2 for the inventory grid and 3 for the crafting table.
+// width is 2 for the inventory grid and 3 for the workbench.
 craft_match :: proc(grid: []Slot, width: int) -> (item: Item, count: int) {
 	if width <= 0 || len(grid) < width*width {
 		return {}, 0
