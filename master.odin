@@ -21,7 +21,8 @@ main :: proc() {
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.BLACK)
 	rl.EndDrawing()
-	rl.DisableCursor()
+	// The title screen needs the cursor. Play grabs it when a world starts.
+	rl.EnableCursor()
 	rl.ClearWindowState({.WINDOW_HIDDEN})
 
 	// 0 means no maximum. Raylib only limits the rate when asked to.
@@ -32,12 +33,20 @@ main :: proc() {
 	hud_font, owned := load_hud_font()
 	defer unload_hud_font(hud_font, owned)
 
-	// The server owns the world. This window is one client of it.
-	server := server_start(generate_seed())
-	defer server_destroy(&server)
+	// The world stays unbuilt until Play, Host, or a successful join. Esc from a
+	// world comes back here, so this window can host and then join someone else.
+	server: Server
 	client: Client
-	defer client_destroy(&client)
-	client_connect(&client, &server)
+	defer session_stop(&server, &client)
+	menu: Menu
+	menu_init(&menu)
+	front := Front.Title
+	want_host := false
+	commands: [dynamic]Player_Command
+	defer delete(commands)
+	// Closing the inventory asks the server to stow the cursor stack first.
+	// A joined game hears about that a frame later, so the request has to wait.
+	pending_close := false
 
 	renderer := renderer_init()
 	defer renderer_destroy(&renderer)
@@ -58,84 +67,245 @@ main :: proc() {
 	// Previous frame's update and draw cost, with the frame limiter's wait left out.
 	work_seconds: f64
 
-	// Loop until the user closes the window or presses Escape.
+	// Loop until the window closes. Esc on the title quits; in a world it leaves.
 	quit := false
 	for !quit && !rl.WindowShouldClose() {
 		frame_start := rl.GetTime()
 		update_display(&display)
-		want_close := false
-		if rl.IsKeyPressed(.E) && !options.open {
-			if client.inventory.open {
-				want_close = true
+
+		// The generating line was drawn last frame, so this hitch keeps it up.
+		if front == .Generating && menu.paint_gen {
+			if session_boot(&server, &client, want_host, &menu) {
+				front = .Playing
+				rl.DisableCursor()
+				options.suppress_look = true
 			} else {
-				inventory_open_screen(&client.inventory)
+				front = .Title
+				rl.EnableCursor()
+			}
+			menu.paint_gen = false
+		}
+		if front == .Connecting && menu.dial_armed && client.link == nil {
+			if reason := client_dial(&client, menu_address(&menu)); reason != "" {
+				menu_set_status(&menu, reason)
+				front = .Join
+				menu.dial_armed = false
 			}
 		}
-		if rl.IsKeyPressed(.O) && !client.inventory.open {
-			options_toggle(&options)
+		if front == .Connecting && client.link != nil {
+			if client_link_pump(&client) {
+				front = .Playing
+				rl.DisableCursor()
+				options.suppress_look = true
+				menu.dial_armed = false
+			} else if client.link.failed {
+				copy_link_reason(&menu, &client)
+				session_stop(&server, &client)
+				front = .Join
+				menu.dial_armed = false
+				rl.EnableCursor()
+			}
 		}
+
 		if rl.IsKeyPressed(.ESCAPE) {
-			if options.open {
-				options_close(&options)
-			} else if client.inventory.open {
-				want_close = true
-			} else {
+			switch front {
+			case .Title:
 				quit = true
+			case .Join:
+				front = .Title
+			case .Connecting:
+				session_stop(&server, &client)
+				front = .Join
+				menu.dial_armed = false
+				rl.EnableCursor()
+			case .Generating:
+				front = .Title
+				menu.paint_gen = false
+			case .Playing:
 			}
 		}
-		options_handle_click(&options, renderer.textures, &taa)
 
-		playing := !options.open && !client.inventory.open
-		look_player(&client.player, playing && !options.suppress_look && !client.inventory.suppress_look)
+		if front == .Title || front == .Join {
+			#partial switch menu_update(&menu, front) {
+			case .Play:
+				want_host = false
+				menu.paint_gen = false
+				menu_clear_status(&menu)
+				front = .Generating
+			case .Host:
+				want_host = true
+				menu.paint_gen = false
+				menu_clear_status(&menu)
+				front = .Generating
+			case .Join:
+				menu_clear_status(&menu)
+				front = .Join
+			case .Connect:
+				if menu.address_len == 0 {
+					menu_set_status(&menu, "Enter an address.")
+				} else {
+					menu.dial_armed = true
+					menu_clear_status(&menu)
+					front = .Connecting
+				}
+			case .Back:
+				menu_clear_status(&menu)
+				front = .Title
+			}
+		}
 
-		frame_dt := f64(rl.GetFrameTime())
-		dt := min(f32(frame_dt), 0.05)
-		input := client_read_input(client.player, playing, client.inventory.open, client.inventory.selected, dt)
-		if want_close {
-			input.action = .Stow
+		playing := false
+		hit := false
+		bx, by, bz: int
+		grown: Grow_Report
+		camera: rl.Camera3D
+		show_self := false
+		if front == .Playing {
+			want_close := false
+			if rl.IsKeyPressed(.E) && !options.open {
+				if client.inventory.open {
+					want_close = true
+				} else {
+					inventory_open_screen(&client.inventory)
+				}
+			}
+			if rl.IsKeyPressed(.O) && !client.inventory.open {
+				options_toggle(&options)
+			}
+			if rl.IsKeyPressed(.V) {
+				client.third_person = !client.third_person
+			}
+			if rl.IsKeyPressed(.ESCAPE) {
+				if options.open {
+					options_close(&options)
+				} else if client.inventory.open {
+					want_close = true
+				} else {
+					session_stop(&server, &client)
+					options.open = false
+					pending_close = false
+					front = .Title
+					rl.EnableCursor()
+				}
+			}
+			if front == .Playing {
+				options_handle_click(&options, renderer.textures, renderer.sprites, &taa)
+				// Right-click on a crafting table opens its grid instead of placing
+				// against it. The open has to land before the look, so this frame's
+				// cursor warp is thrown away with the other screens.
+				opened_table := false
+				if !options.open && !client.inventory.open && rl.IsMouseButtonPressed(.RIGHT) {
+					eye := camera_from_player(client.player)
+					look := eye.target - eye.position
+					thit, tx, ty, tz, _, _, _ := raycast_block(&client.world, eye.position, look, MINE_REACH)
+					if thit && get_block(&client.world, tx, ty, tz) == .Crafting_Table {
+						inventory_open_table(&client.inventory)
+						opened_table = true
+					}
+				}
+				playing = !options.open && !client.inventory.open
+				look_player(&client.player, playing && !options.suppress_look && !client.inventory.suppress_look)
+
+				frame_dt := f64(rl.GetFrameTime())
+				dt := min(f32(frame_dt), 0.05)
+				// The click that opened the table is not also a click inside it.
+				screen_open := client.inventory.open && !opened_table
+				input := client_read_input(client.player, playing, screen_open, client.inventory.table, client.inventory.selected, dt)
+				if want_close {
+					input.action = .Stow
+					pending_close = true
+				}
+				if client.server != nil {
+					clear(&commands)
+					append(&commands, Player_Command{id = client.id, input = input})
+					host_pump(&server, &commands)
+					grown = server_step(&server, commands[:], frame_dt)
+					host_broadcast(&server)
+					client_pull(&client)
+				} else if !client_send_input(&client, input) || !client_link_pump(&client) {
+					copy_link_reason(&menu, &client)
+					session_stop(&server, &client)
+					options.open = false
+					pending_close = false
+					front = .Join
+					rl.EnableCursor()
+				}
+				if front == .Playing && pending_close && client.inventory.held.count == 0 {
+					inventory_close_screen(&client.inventory)
+					pending_close = false
+				}
+				options.suppress_look = false
+				client.inventory.suppress_look = false
+				if front == .Playing {
+					advance_walk_cycles(&client, dt)
+					// Mining stays on the eye ray. Third person only moves the view.
+					eye := camera_from_player(client.player)
+					camera = eye
+					if client.third_person {
+						distance: f32
+						camera, distance = camera_behind(&client.world, client.player)
+						show_self = distance >= THIRD_PERSON_HIDE
+					}
+					look := eye.target - eye.position
+					hit, bx, by, bz, _, _, _ = raycast_block(&client.world, eye.position, look, MINE_REACH)
+				}
+			}
 		}
-		command := [1]Player_Command{{id = client.id, input = input}}
-		grown := server_step(&server, command[:], frame_dt)
-		client_pull(&client)
-		if want_close && client.inventory.held.count == 0 {
-			inventory_close_screen(&client.inventory)
-		}
-		options.suppress_look = false
-		client.inventory.suppress_look = false
-		camera := camera_from_player(client.player)
-		look := camera.target - camera.position
-		hit, bx, by, bz, _, _, _ := raycast_block(&client.world, camera.position, look, MINE_REACH)
 
 		// Start a new frame.
 		rl.BeginDrawing()
-		// Fill the background with sky blue.
-		rl.ClearBackground(rl.SKYBLUE)
+		if front == .Playing {
+			// Fill the background with sky blue.
+			rl.ClearBackground(rl.SKYBLUE)
 
-		// The world is jittered and accumulated when those options are on. The HUD
-		// stays on the backbuffer, after the resolve, so the crosshair and text
-		// are not blended across frames.
-		taa_begin(&taa, &msaa, camera, options.taa, options.msaa)
-		draw_world(&renderer, &client.world)
-		draw_drops(&renderer, client.drops[:])
-		draw_remote_players(&renderer, client.others[:])
-		if playing && hit {
-			draw_block_highlight(bx, by, bz, camera.position)
-		}
-		taa_resolve(&taa, &msaa)
+			// The world is jittered and accumulated when those options are on. The HUD
+			// stays on the backbuffer, after the resolve, so the crosshair and text
+			// are not blended across frames.
+			taa_begin(&taa, &msaa, camera, options.taa, options.msaa)
+			draw_world(&renderer, &client.world)
+			draw_drops(&renderer, client.drops[:], .Opaque)
+			draw_drops(&renderer, client.drops[:], .Cutout)
+			draw_remote_players(&renderer, client.others[:])
+			if show_self {
+				draw_local_player(&renderer, &client)
+			}
+			draw_water(&renderer)
+			draw_drops(&renderer, client.drops[:], .Translucent)
+			if playing && hit {
+				draw_block_highlight(bx, by, bz, camera.position)
+			}
+			taa_resolve(&taa, &msaa)
 
-		if playing {
-			draw_crosshair()
-		}
-		draw_fps(hud_font, 8, 8)
-		draw_frame_time(hud_font, 8, 30)
-		draw_extrapolated_fps(hud_font, 8, 52, work_seconds)
-		draw_world_seed(hud_font, 8, 74, client.seed)
-		draw_block_updates(hud_font, 8, 96, grown, grow_queued(&server.world))
-		draw_player_position(hud_font, client.player)
-		draw_player_direction(hud_font, client.player)
-		draw_inventory(hud_font, &renderer, client.inventory)
-		if options.open {
-			draw_options(hud_font, options)
+			// After the resolve, so clearing depth cannot wipe the buffer the
+			// temporal pass just read. Third person already draws the body.
+			if !client.third_person {
+				draw_viewmodel(&renderer, camera, equipped_item(&client.inventory))
+			}
+
+			if playing {
+				draw_crosshair()
+			}
+			draw_fps(hud_font, 8, 8)
+			draw_frame_time(hud_font, 8, 30)
+			draw_extrapolated_fps(hud_font, 8, 52, work_seconds)
+			draw_world_seed(hud_font, 8, 74, client.seed)
+			if client.server != nil {
+				draw_block_updates(hud_font, 8, 96, grown, grow_queued(&server.world))
+				draw_host_banner(hud_font, &server)
+			} else {
+				draw_hud_text(hud_font, "Joined", 8, 96, rl.WHITE)
+			}
+			draw_player_position(hud_font, client.player)
+			draw_player_direction(hud_font, client.player)
+			draw_inventory(hud_font, &renderer, client.inventory)
+			if options.open {
+				draw_options(hud_font, options)
+			}
+		} else {
+			draw_front(hud_font, &menu, front)
+			if front == .Generating {
+				menu.paint_gen = true
+			}
 		}
 
 		// Sampled here because EndDrawing is where raylib waits out the frame limiter,
@@ -144,6 +314,63 @@ main :: proc() {
 
 		// Finish the frame and show it.
 		rl.EndDrawing()
+	}
+}
+
+session_boot :: proc(server: ^Server, client: ^Client, host: bool, menu: ^Menu) -> bool {
+	server^ = server_start(generate_seed())
+	if host {
+		if reason := host_listen(server); reason != "" {
+			server_destroy(server)
+			server^ = {}
+			menu_set_status(menu, reason)
+			return false
+		}
+	}
+	client_connect(client, server)
+	return true
+}
+
+session_stop :: proc(server: ^Server, client: ^Client) {
+	client_destroy(client)
+	server_destroy(server)
+	client^ = {}
+	server^ = {}
+}
+
+copy_link_reason :: proc(menu: ^Menu, client: ^Client) {
+	link := client.link
+	if link == nil || link.reason[0] == 0 {
+		menu_set_status(menu, "Lost the connection to the host.")
+		return
+	}
+	n := 0
+	for n < len(link.reason) && link.reason[n] != 0 {
+		n += 1
+	}
+	menu_set_status(menu, string(link.reason[:n]))
+}
+
+draw_host_banner :: proc(font: rl.Font, server: ^Server) {
+	if !server.host.listening || server.host.join_at[0] == 0 {
+		return
+	}
+	text := rl.TextFormat("Others can join at %s", cstring(raw_data(server.host.join_at[:])))
+	draw_hud_text(font, text, 8, 162, rl.WHITE)
+	y: c.int = 184
+	if server.host.lan {
+		local := rl.TextFormat("Same computer: 127.0.0.1:%d", c.int(server.host.port))
+		draw_hud_text(font, local, 8, y, rl.WHITE)
+		y += 22
+	}
+	others := len(server.players) - 1
+	if others == 0 {
+		draw_hud_text(font, "Waiting for others", 8, y, rl.WHITE)
+	} else if others == 1 {
+		draw_hud_text(font, "1 other player", 8, y, rl.WHITE)
+	} else {
+		text = rl.TextFormat("%d other players", c.int(others))
+		draw_hud_text(font, text, 8, y, rl.WHITE)
 	}
 }
 

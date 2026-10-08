@@ -1,9 +1,9 @@
 package main
 
 // The world, the players, and their inventories live here. A client sends an
-// input and copies the result back; it does not write the world. Today that
-// copy happens in this process. The same input and the same block list are
-// what a later connection would send across a socket.
+// input and copies the result back; it does not write the world. In this
+// process that copy is direct. A hosted world sends the same input and the
+// same block list across a socket, which is what another player's game joins.
 
 Inventory_Action :: enum u8 {
 	None,
@@ -33,10 +33,21 @@ Player_Command :: struct {
 
 // Where another player is standing. The client that owns them already has the
 // full player; everyone else gets this.
+// phase and amount are the walk cycle. They are derived on the client from
+// how far this player moved since the previous draw, so they are not replicated.
 Remote_View :: struct {
 	id:               u32,
 	position:         [3]f32,
 	yaw, pitch:       f32,
+	phase, amount:    f32,
+}
+
+// Remembers a remote player's stride between draws. The view itself is rebuilt
+// every step, which would otherwise restart the animation.
+Walk_Cycle :: struct {
+	phase, amount: f32,
+	x, z:          f32,
+	has:           bool,
 }
 
 Server_Player :: struct {
@@ -54,6 +65,8 @@ Server :: struct {
 	drops:   [dynamic]Drop,
 	// Pop direction. The low bit is forced on so the generator cannot sit at zero.
 	drop_rng: u64,
+	// Present only while this process is hosting. Solo play leaves it empty.
+	host:    Host_Link,
 }
 
 server_start :: proc(seed: i64) -> Server {
@@ -66,6 +79,7 @@ server_start :: proc(seed: i64) -> Server {
 }
 
 server_destroy :: proc(server: ^Server) {
+	host_shutdown(server)
 	for _, player in server.players {
 		free(player)
 	}
@@ -77,9 +91,11 @@ server_destroy :: proc(server: ^Server) {
 
 server_join :: proc(server: ^Server) -> u32 {
 	server.next_id += 1
+	// A step apart, so two people are not born inside one body.
+	x := SPAWN_X + int(server.next_id-1)*2
 	player := new(Server_Player)
 	player.player = {
-		position = spawn_position(&server.world),
+		position = {f32(x), f32(surface_height(&server.world, x, SPAWN_Z)), f32(SPAWN_Z)},
 		grounded = true,
 	}
 	server.players[server.next_id] = player
@@ -141,15 +157,24 @@ server_inventory :: proc(server: ^Server, player: ^Server_Player, action: Invent
 		inv.selected = (inv.selected - 1) %% HOTBAR_SLOTS
 	case .Scroll_Down:
 		inv.selected = (inv.selected + 1) %% HOTBAR_SLOTS
-	case .Click_Left:
-		if slot >= 0 && slot < INVENTORY_SLOTS {
-			inventory_click_left(&inv.held, &inv.slots[slot])
-		}
-	case .Click_Right:
-		if slot >= 0 && slot < INVENTORY_SLOTS {
-			inventory_click_right(&inv.held, &inv.slots[slot])
+	case .Click_Left, .Click_Right:
+		whole := action == .Click_Left
+		if slot == CRAFT2_RESULT {
+			craft_take(inv.craft2[:], 2, &inv.held, whole)
+		} else if slot == CRAFT3_RESULT {
+			craft_take(inv.craft3[:], 3, &inv.held, whole)
+		} else if stack, ok := inventory_slot_mut(inv, slot); ok {
+			if whole {
+				inventory_click_left(&inv.held, stack)
+			} else {
+				inventory_click_right(&inv.held, stack)
+			}
 		}
 	case .Stow:
+		// Closing returns whatever was sitting in either crafting grid. A full
+		// inventory drops the rest, so the ingredients are not stuck off screen.
+		server_empty_grid(server, player, inv.craft2[:])
+		server_empty_grid(server, player, inv.craft3[:])
 		inventory_stow(inv)
 	case .Drop:
 		server_drop_item(server, player, slot, false)
@@ -162,25 +187,41 @@ server_inventory :: proc(server: ^Server, player: ^Server_Player, action: Invent
 // whole sends the entire stack; otherwise a single item leaves it.
 server_drop_item :: proc(server: ^Server, player: ^Server_Player, slot: int, whole: bool) {
 	stack: ^Slot
-	if slot >= 0 && slot < INVENTORY_SLOTS {
-		stack = &player.inventory.slots[slot]
-	} else if slot == -1 {
+	if slot == -1 {
 		stack = &player.inventory.held
+	} else if found, ok := inventory_slot_mut(&player.inventory, slot); ok {
+		stack = found
 	} else {
 		return
 	}
-	if stack.count <= 0 || stack.block == .Air {
+	if stack.count <= 0 || item_empty(stack.item) {
 		return
 	}
 	take := stack.count if whole else 1
-	block := stack.block
+	item := stack.item
 	stack.count -= take
 	if stack.count == 0 {
-		stack.block = .Air
+		stack^ = {}
 	}
 	origin := player.player.position + {0, PLAYER_EYE_HEIGHT - 0.3, 0}
 	dir := look_direction(player.player.yaw, player.player.pitch)
-	drop_throw(&server.drops, &server.drop_rng, block, take, origin, dir)
+	drop_throw(&server.drops, &server.drop_rng, item, take, origin, dir)
+}
+
+// Puts a crafting grid back into the inventory, and throws what does not fit.
+server_empty_grid :: proc(server: ^Server, player: ^Server_Player, grid: []Slot) {
+	for &slot in grid {
+		if slot.count <= 0 {
+			continue
+		}
+		left := inventory_add(&player.inventory, slot.item, slot.count)
+		if left > 0 {
+			origin := player.player.position + {0, PLAYER_EYE_HEIGHT - 0.3, 0}
+			dir := look_direction(player.player.yaw, player.player.pitch)
+			drop_throw(&server.drops, &server.drop_rng, slot.item, left, origin, dir)
+		}
+		slot = {}
+	}
 }
 
 server_attack :: proc(server: ^Server, player: ^Server_Player) {
@@ -193,7 +234,7 @@ server_attack :: proc(server: ^Server, player: ^Server_Player) {
 		return
 	}
 	set_block(&server.world, x, y, z, .Air)
-	drop_spawn(&server.drops, &server.drop_rng, broken, 1, x, y, z)
+	drop_spawn(&server.drops, &server.drop_rng, item_block(broken), 1, x, y, z)
 }
 
 server_use :: proc(server: ^Server, player: ^Server_Player) {

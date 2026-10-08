@@ -10,6 +10,8 @@ foreign import opengl32 "system:opengl32.lib"
 @(default_calling_convention = "system")
 foreign opengl32 {
 	wglGetProcAddress :: proc(name: cstring) -> rawptr ---
+	// OpenGL 1.1, so it lives in the DLL and does not need wglGetProcAddress.
+	glClear :: proc(mask: u32) ---
 }
 
 // Raylib's blit always filters with nearest, which is not a legal resolve of a
@@ -131,6 +133,13 @@ msaa_resolve :: proc(msaa: ^MSAA, dest: c.uint, depth: bool) {
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, 0)
 	rlgl.Viewport(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight())
+}
+
+// Color stays. The viewmodel is drawn over the resolved world, and a near wall
+// must not win the depth test against it.
+clear_depth_buffer :: proc() -> bool {
+	glClear(GL_DEPTH_BUFFER_BIT)
+	return true
 }
 
 msaa_destroy :: proc(msaa: ^MSAA) {

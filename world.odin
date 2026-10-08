@@ -15,6 +15,8 @@ Block :: enum u8 {
 	Water,
 	Oak_Log,
 	Oak_Leaves,
+	Oak_Planks,
+	Crafting_Table,
 }
 
 // A power of two, so splitting a world coordinate is a shift and a mask.

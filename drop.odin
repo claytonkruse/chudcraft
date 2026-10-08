@@ -28,7 +28,7 @@ DROP_LIFETIME :: f32(300)
 
 // One stack lying in the world. Position is the center of the cube.
 Drop :: struct {
-	block:    Block,
+	item:     Item,
 	count:    int,
 	position: [3]f32,
 	velocity: [3]f32,
@@ -42,22 +42,23 @@ Drop :: struct {
 
 // What a client needs in order to draw a stack. The motion stays on the server.
 Drop_View :: struct {
-	block:    Block,
+	item:     Item,
 	count:    int,
 	position: [3]f32,
 	age:      f32,
 	phase:    f32,
 }
 
-drop_spawn :: proc(drops: ^[dynamic]Drop, rng: ^u64, block: Block, count, x, y, z: int) {
-	if block == .Air || count <= 0 {
+drop_spawn :: proc(drops: ^[dynamic]Drop, rng: ^u64, item: Item, count, x, y, z: int) {
+	if item_empty(item) || count <= 0 {
 		return
 	}
+	limit := stack_limit(item)
 	left := count
 	for left > 0 {
-		take := min(left, STACK_MAX)
+		take := min(left, limit)
 		append(drops, Drop{
-			block = block,
+			item = item,
 			count = take,
 			position = {f32(x), f32(y) + 0.5, f32(z)},
 			velocity = {
@@ -73,8 +74,8 @@ drop_spawn :: proc(drops: ^[dynamic]Drop, rng: ^u64, block: Block, count, x, y, 
 }
 
 // Leaves the hand along the look, a step ahead of the body.
-drop_throw :: proc(drops: ^[dynamic]Drop, rng: ^u64, block: Block, count: int, origin, direction: [3]f32) {
-	if block == .Air || count <= 0 {
+drop_throw :: proc(drops: ^[dynamic]Drop, rng: ^u64, item: Item, count: int, origin, direction: [3]f32) {
+	if item_empty(item) || count <= 0 {
 		return
 	}
 	dir := direction
@@ -86,9 +87,9 @@ drop_throw :: proc(drops: ^[dynamic]Drop, rng: ^u64, block: Block, count: int, o
 	}
 	left := count
 	for left > 0 {
-		take := min(left, STACK_MAX)
+		take := min(left, stack_limit(item))
 		append(drops, Drop{
-			block = block,
+			item = item,
 			count = take,
 			position = origin + dir * 0.45,
 			velocity = dir * DROP_THROW + {
@@ -255,10 +256,10 @@ drop_merge :: proc(drops: ^[dynamic]Drop) {
 		}
 		for j in i + 1 ..< n {
 			b := &drops[j]
-			if b.count <= 0 || !b.grounded || b.block != a.block {
+			if b.count <= 0 || !b.grounded || !item_same(b.item, a.item) {
 				continue
 			}
-			if a.count + b.count > STACK_MAX {
+			if a.count + b.count > stack_limit(a.item) {
 				continue
 			}
 			d := a.position - b.position
@@ -283,7 +284,7 @@ drop_collect :: proc(drops: ^[dynamic]Drop, inv: ^Inventory, player: Player) {
 		if p.x < min.x || p.x > max.x || p.y < min.y || p.y > max.y || p.z < min.z || p.z > max.z {
 			continue
 		}
-		drop.count = inventory_add(inv, drop.block, drop.count)
+		drop.count = inventory_add(inv, drop.item, drop.count)
 	}
 }
 

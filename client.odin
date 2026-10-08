@@ -13,6 +13,11 @@ Client :: struct {
 	seed:      i64,
 	others:    [dynamic]Remote_View,
 	drops:     [dynamic]Drop_View,
+	walks:     map[u32]Walk_Cycle,
+	// This window only. Another player does not see your camera.
+	third_person: bool,
+	// Set when this window joined someone else's host. Nil for the host itself.
+	link:      ^Client_Link,
 }
 
 client_connect :: proc(client: ^Client, server: ^Server) {
@@ -31,8 +36,10 @@ client_destroy :: proc(client: ^Client) {
 	if client.server != nil && client.id != 0 {
 		server_leave(client.server, client.id)
 	}
+	client_link_close(client)
 	delete(client.others)
 	delete(client.drops)
+	delete(client.walks)
 	world_destroy(&client.world)
 	client.server = nil
 	client.id = 0
@@ -48,10 +55,12 @@ client_pull :: proc(client: ^Client) {
 	if player != nil {
 		open := client.inventory.open
 		suppress := client.inventory.suppress_look
+		table := client.inventory.table
 		client.player = player.player
 		client.inventory = player.inventory
 		client.inventory.open = open
 		client.inventory.suppress_look = suppress
+		client.inventory.table = table
 	}
 	for change in client.server.world.changes {
 		store_block(&client.world, change.x, change.y, change.z, change.block)
@@ -59,7 +68,7 @@ client_pull :: proc(client: ^Client) {
 	clear(&client.drops)
 	for drop in client.server.drops {
 		append(&client.drops, Drop_View{
-			block    = drop.block,
+			item     = drop.item,
 			count    = drop.count,
 			position = drop.position,
 			age      = drop.age,
@@ -81,7 +90,7 @@ client_pull :: proc(client: ^Client) {
 }
 
 // Keys and mouse become a message. Nothing here changes the world.
-client_read_input :: proc(player: Player, playing, inventory_open: bool, selected: int, move_dt: f32) -> Client_Input {
+client_read_input :: proc(player: Player, playing, inventory_open, table: bool, selected: int, move_dt: f32) -> Client_Input {
 	input := Client_Input{
 		move = {
 			dt = move_dt,
@@ -121,7 +130,7 @@ client_read_input :: proc(player: Player, playing, inventory_open: bool, selecte
 		// The slot under the cursor, or the stack on it when the cursor is elsewhere.
 		if rl.IsKeyPressed(.Q) {
 			input.action = .Drop
-			if index, ok := inventory_slot_at(rl.GetMousePosition()); ok {
+			if index, ok := inventory_slot_at(rl.GetMousePosition(), table); ok {
 				input.slot = index
 			} else {
 				input.slot = -1
@@ -132,11 +141,11 @@ client_read_input :: proc(player: Player, playing, inventory_open: bool, selecte
 		right := rl.IsMouseButtonPressed(.RIGHT)
 		if left || right {
 			mouse := rl.GetMousePosition()
-			index, ok := inventory_slot_at(mouse)
+			index, ok := inventory_slot_at(mouse, table)
 			if ok {
 				input.action = .Click_Right if right && !left else .Click_Left
 				input.slot = index
-			} else if !rl.CheckCollisionPointRec(mouse, inventory_layout(true).panel) {
+			} else if !rl.CheckCollisionPointRec(mouse, inventory_layout(true, table).panel) {
 				// Past the panel edge, the stack on the cursor leaves the inventory.
 				// Left sends the whole stack, right sends one.
 				input.action = .Drop_All if left else .Drop

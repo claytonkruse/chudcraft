@@ -20,6 +20,9 @@ Surface :: enum {
 	Oak_Log_Top,
 	Oak_Log_Side,
 	Oak_Leaves,
+	Oak_Planks,
+	Crafting_Top,
+	Crafting_Front,
 }
 
 // Which draw pass a surface belongs to. Cutout keeps depth writes on and throws away
@@ -103,6 +106,18 @@ Block_Textures :: struct {
 	oak_log_top:  rl.Texture2D,
 	oak_log_side: rl.Texture2D,
 	oak_leaves:   rl.Texture2D,
+	oak_planks:   rl.Texture2D,
+	crafting_top:   rl.Texture2D,
+	crafting_front: rl.Texture2D,
+}
+
+// Flat pictures for sticks and tools. Blocks keep the cube icons.
+Item_Sprites :: struct {
+	stick:          rl.Texture2D,
+	wood_shovel:    rl.Texture2D,
+	wood_pickaxe:   rl.Texture2D,
+	stone_shovel:   rl.Texture2D,
+	stone_pickaxe:  rl.Texture2D,
 }
 
 // A chunk's geometry on the GPU, kept between frames and rebuilt only when the
@@ -133,6 +148,11 @@ Renderer :: struct {
 	icons:     [Block]rl.RenderTexture2D,
 	// The cube those pictures were drawn from, kept so a drop can spin in the world.
 	item_meshes: [Block]Chunk_Mesh,
+	sprites:   Item_Sprites,
+	// One upright quad and a material whose texture is swapped per item. The
+	// material must not own that texture, or unloading it would free the sprite.
+	item_quad: rl.Mesh,
+	item_material: rl.Material,
 	player:    Player_Model,
 }
 
@@ -153,6 +173,12 @@ renderer_init :: proc() -> Renderer {
 		renderer.materials[surface] = material
 	}
 	build_block_icons(&renderer)
+	renderer.sprites = load_item_sprites()
+	renderer.item_quad = build_item_quad()
+	renderer.item_material = rl.LoadMaterialDefault()
+	if renderer.cutout.id != 0 {
+		renderer.item_material.shader = renderer.cutout
+	}
 	player_model_init(&renderer)
 	return renderer
 }
@@ -189,6 +215,17 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 		delete(renderer.build[surface].indices)
 	}
 
+	renderer.item_material.shader = {
+		id   = rlgl.GetShaderIdDefault(),
+		locs = rlgl.GetShaderLocsDefault(),
+	}
+	rl.SetMaterialTexture(&renderer.item_material, .ALBEDO, {id = rlgl.GetTextureIdDefault()})
+	rl.UnloadMaterial(renderer.item_material)
+	if renderer.item_quad.vertexCount > 0 {
+		rl.UnloadMesh(renderer.item_quad)
+	}
+	unload_item_sprites(renderer.sprites)
+
 	if renderer.cutout.id != 0 {
 		rl.UnloadShader(renderer.cutout)
 	}
@@ -200,7 +237,10 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 	player_model_destroy(&renderer.player)
 }
 
-// Rebuilds whatever is dirty, then draws every chunk mesh once.
+// Rebuilds whatever is dirty, then draws the depth-writing passes.
+// Water is draw_water, and it has to come after players and drops. Those write
+// depth; water does not, so anything drawn after it composites in front of the
+// surface even when it is standing behind it.
 draw_world :: proc(renderer: ^Renderer, world: ^World) {
 	for key, chunk in world.chunks {
 		mesh := renderer.meshes[key]
@@ -218,9 +258,11 @@ draw_world :: proc(renderer: ^Renderer, world: ^World) {
 	// Depth-writing passes first, so the depth buffer is complete before anything blends.
 	draw_pass(renderer, .Opaque)
 	draw_pass(renderer, .Cutout)
+}
 
-	// Water must not hide what is behind it. With depth writes off it also cannot hide
-	// other water, which is what lets this pass skip sorting the meshes entirely.
+// Water must not hide what is behind it. With depth writes off it also cannot hide
+// other water, which is what lets this pass skip sorting the meshes entirely.
+draw_water :: proc(renderer: ^Renderer) {
 	rl.BeginBlendMode(.ALPHA)
 	rlgl.DisableDepthMask()
 	draw_pass(renderer, .Translucent)
@@ -393,32 +435,39 @@ unload_chunk_mesh :: proc(mesh: ^Chunk_Mesh) {
 // A drop is the block's cube, small, spinning, and hovering just off the face it landed on.
 DROP_DRAW_SCALE :: f32(0.25)
 
-draw_drops :: proc(renderer: ^Renderer, drops: []Drop_View) {
+draw_drops :: proc(renderer: ^Renderer, drops: []Drop_View, pass: Surface_Pass) {
 	if len(drops) == 0 {
 		return
 	}
-	for pass in Surface_Pass {
-		if pass == .Translucent {
-			rl.BeginBlendMode(.ALPHA)
-			rlgl.DisableDepthMask()
+	if pass == .Translucent {
+		rl.BeginBlendMode(.ALPHA)
+		rlgl.DisableDepthMask()
+	}
+	for drop in drops {
+		hover := 0.04 + math.sin(drop.age * 3 + drop.phase) * 0.03
+		spin := rl.MatrixRotateY(drop.age * 2.4 + drop.phase)
+		place := rl.MatrixTranslate(drop.position.x, drop.position.y + hover, drop.position.z)
+		// Tools and sticks are a flat picture. The transparent texels belong to
+		// the cutout pass, the same way leaves do.
+		if drop.item.kind != .Block {
+			if pass == .Cutout {
+				scale := rl.MatrixScale(0.5, 0.5, 0.5)
+				draw_item_sprite(renderer, drop.item, place*spin*scale)
+			}
+			continue
 		}
-		for drop in drops {
-			mesh := &renderer.item_meshes[drop.block]
-			hover := 0.04 + math.sin(drop.age * 3 + drop.phase) * 0.03
-			spin := rl.MatrixRotateY(drop.age * 2.4 + drop.phase)
-			scale := rl.MatrixScale(DROP_DRAW_SCALE, DROP_DRAW_SCALE, DROP_DRAW_SCALE)
-			place := rl.MatrixTranslate(drop.position.x, drop.position.y + hover, drop.position.z)
-			transform := place * spin * scale
-			for surface in Surface {
-				if mesh.filled[surface] && surface_pass(surface) == pass {
-					rl.DrawMesh(mesh.meshes[surface], renderer.materials[surface], transform)
-				}
+		mesh := &renderer.item_meshes[drop.item.block]
+		scale := rl.MatrixScale(DROP_DRAW_SCALE, DROP_DRAW_SCALE, DROP_DRAW_SCALE)
+		transform := place * spin * scale
+		for surface in Surface {
+			if mesh.filled[surface] && surface_pass(surface) == pass {
+				rl.DrawMesh(mesh.meshes[surface], renderer.materials[surface], transform)
 			}
 		}
-		if pass == .Translucent {
-			rlgl.EnableDepthMask()
-			rl.EndBlendMode()
-		}
+	}
+	if pass == .Translucent {
+		rlgl.EnableDepthMask()
+		rl.EndBlendMode()
 	}
 }
 
@@ -470,6 +519,79 @@ draw_icon_mesh :: proc(renderer: ^Renderer, mesh: ^Chunk_Mesh, target: rl.Render
 	rlgl.Viewport(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight())
 }
 
+// A unit quad in the XY plane, facing +Z, so a view-space draw looks at the picture.
+build_item_quad :: proc() -> rl.Mesh {
+	vertices := [?]f32 {
+		-0.5, -0.5, 0,
+		0.5, -0.5, 0,
+		0.5, 0.5, 0,
+		-0.5, 0.5, 0,
+	}
+	texcoords := [?]f32 {
+		0, 1,
+		1, 1,
+		1, 0,
+		0, 0,
+	}
+	colors := [?]u8 {
+		255, 255, 255, 255,
+		255, 255, 255, 255,
+		255, 255, 255, 255,
+		255, 255, 255, 255,
+	}
+	indices := [?]u16 {0, 1, 2, 0, 2, 3}
+	mesh := rl.Mesh {
+		vertexCount   = 4,
+		triangleCount = 2,
+		vertices      = clone_for_raylib(vertices[:]),
+		texcoords     = clone_for_raylib(texcoords[:]),
+		colors        = clone_for_raylib(colors[:]),
+		indices       = clone_for_raylib(indices[:]),
+	}
+	rl.UploadMesh(&mesh, false)
+	return mesh
+}
+
+item_sprite :: proc(sprites: Item_Sprites, item: Item) -> rl.Texture2D {
+	switch item.kind {
+	case .Stick:
+		return sprites.stick
+	case .Wood_Shovel:
+		return sprites.wood_shovel
+	case .Wood_Pickaxe:
+		return sprites.wood_pickaxe
+	case .Stone_Shovel:
+		return sprites.stone_shovel
+	case .Stone_Pickaxe:
+		return sprites.stone_pickaxe
+	case .None, .Block:
+		return {}
+	}
+	return {}
+}
+
+draw_item_sprite :: proc(renderer: ^Renderer, item: Item, transform: rl.Matrix) {
+	tex := item_sprite(renderer.sprites, item)
+	if tex.id == 0 || renderer.item_quad.vertexCount == 0 {
+		return
+	}
+	rl.SetMaterialTexture(&renderer.item_material, .ALBEDO, tex)
+	rl.DrawMesh(renderer.item_quad, renderer.item_material, transform)
+}
+
+draw_item_icon :: proc(renderer: ^Renderer, item: Item, dest: rl.Rectangle) {
+	if item.kind == .Block {
+		draw_block_icon(renderer, item.block, dest)
+		return
+	}
+	tex := item_sprite(renderer.sprites, item)
+	if tex.id == 0 {
+		return
+	}
+	src := rl.Rectangle{0, 0, f32(tex.width), f32(tex.height)}
+	rl.DrawTexturePro(tex, src, dest, {}, 0, rl.WHITE)
+}
+
 // The picture is bottom-up, so the source height is negative and it draws upright.
 draw_block_icon :: proc(renderer: ^Renderer, block: Block, dest: rl.Rectangle) {
 	icon := renderer.icons[block]
@@ -513,6 +635,17 @@ block_surface :: proc(block: Block, face: Face) -> Surface {
 		}
 	case .Oak_Leaves:
 		return .Oak_Leaves
+	case .Oak_Planks:
+		return .Oak_Planks
+	case .Crafting_Table:
+		switch face {
+		case .Pos_Y:
+			return .Crafting_Top
+		case .Neg_Y:
+			return .Oak_Planks
+		case .Pos_X, .Neg_X, .Pos_Z, .Neg_Z:
+			return .Crafting_Front
+		}
 	case .Stone, .Air:
 		return .Stone
 	}
@@ -545,6 +678,12 @@ surface_texture :: proc(textures: Block_Textures, surface: Surface) -> rl.Textur
 		return textures.oak_log_side
 	case .Oak_Leaves:
 		return textures.oak_leaves
+	case .Oak_Planks:
+		return textures.oak_planks
+	case .Crafting_Top:
+		return textures.crafting_top
+	case .Crafting_Front:
+		return textures.crafting_front
 	}
 	return {}
 }
@@ -583,6 +722,12 @@ surface_tint :: proc(surface: Surface, textured: bool) -> [4]u8 {
 		return {175, 143, 85, 255}
 	case .Oak_Log_Side:
 		return {103, 82, 49, 255}
+	case .Oak_Planks:
+		return {168, 134, 80, 255}
+	case .Crafting_Top:
+		return {140, 110, 65, 255}
+	case .Crafting_Front:
+		return {122, 96, 56, 255}
 	}
 	return WHITE_TINT
 }
@@ -602,6 +747,9 @@ load_block_textures :: proc() -> Block_Textures {
 		oak_log_top  = rl.LoadTexture("assets/textures/oak_log_top.png"),
 		oak_log_side = rl.LoadTexture("assets/textures/oak_log.png"),
 		oak_leaves   = rl.LoadTexture("assets/textures/oak_leaves.png"),
+		oak_planks     = rl.LoadTexture("assets/textures/oak_planks.png"),
+		crafting_top   = rl.LoadTexture("assets/textures/crafting_table_top.png"),
+		crafting_front = rl.LoadTexture("assets/textures/crafting_table_front.png"),
 	}
 	prepare_texture(&textures.grass_top)
 	prepare_texture(&textures.grass_side)
@@ -615,7 +763,34 @@ load_block_textures :: proc() -> Block_Textures {
 	prepare_texture(&textures.oak_log_top)
 	prepare_texture(&textures.oak_log_side)
 	prepare_texture(&textures.oak_leaves)
+	prepare_texture(&textures.oak_planks)
+	prepare_texture(&textures.crafting_top)
+	prepare_texture(&textures.crafting_front)
 	return textures
+}
+
+load_item_sprites :: proc() -> Item_Sprites {
+	sprites := Item_Sprites {
+		stick         = rl.LoadTexture("assets/textures/stick.png"),
+		wood_shovel   = rl.LoadTexture("assets/textures/wooden_shovel.png"),
+		wood_pickaxe  = rl.LoadTexture("assets/textures/wooden_pickaxe.png"),
+		stone_shovel  = rl.LoadTexture("assets/textures/stone_shovel.png"),
+		stone_pickaxe = rl.LoadTexture("assets/textures/stone_pickaxe.png"),
+	}
+	prepare_texture(&sprites.stick)
+	prepare_texture(&sprites.wood_shovel)
+	prepare_texture(&sprites.wood_pickaxe)
+	prepare_texture(&sprites.stone_shovel)
+	prepare_texture(&sprites.stone_pickaxe)
+	return sprites
+}
+
+unload_item_sprites :: proc(sprites: Item_Sprites) {
+	if sprites.stick.id != 0 do rl.UnloadTexture(sprites.stick)
+	if sprites.wood_shovel.id != 0 do rl.UnloadTexture(sprites.wood_shovel)
+	if sprites.wood_pickaxe.id != 0 do rl.UnloadTexture(sprites.wood_pickaxe)
+	if sprites.stone_shovel.id != 0 do rl.UnloadTexture(sprites.stone_shovel)
+	if sprites.stone_pickaxe.id != 0 do rl.UnloadTexture(sprites.stone_pickaxe)
 }
 
 // The chain has to exist before the filter is chosen. Raylib only selects a mip
@@ -655,6 +830,25 @@ set_block_mipmaps :: proc(textures: Block_Textures, enabled: bool) {
 	set(textures.oak_log_top, filter)
 	set(textures.oak_log_side, filter)
 	set(textures.oak_leaves, filter)
+	set(textures.oak_planks, filter)
+	set(textures.crafting_top, filter)
+	set(textures.crafting_front, filter)
+}
+
+set_item_mipmaps :: proc(sprites: Item_Sprites, enabled: bool) {
+	filter: c.int = 0x2700 if enabled else 0x2600
+	set :: proc(texture: rl.Texture2D, filter: c.int) {
+		if texture.id == 0 {
+			return
+		}
+		rlgl.TextureParameters(texture.id, 0x2801, filter)
+		rlgl.TextureParameters(texture.id, 0x2800, 0x2600)
+	}
+	set(sprites.stick, filter)
+	set(sprites.wood_shovel, filter)
+	set(sprites.wood_pickaxe, filter)
+	set(sprites.stone_shovel, filter)
+	set(sprites.stone_pickaxe, filter)
 }
 
 // Far enough in front of the block face that the wires win the depth test, close enough to still read as the block edge.

@@ -50,7 +50,7 @@ options_close :: proc(options: ^Options) {
 	rl.DisableCursor()
 }
 
-options_handle_click :: proc(options: ^Options, textures: Block_Textures, taa: ^TAA) {
+options_handle_click :: proc(options: ^Options, textures: Block_Textures, sprites: Item_Sprites, taa: ^TAA) {
 	if !options.open || !rl.IsMouseButtonPressed(.LEFT) {
 		return
 	}
@@ -62,6 +62,7 @@ options_handle_click :: proc(options: ^Options, textures: Block_Textures, taa: ^
 	case .Mipmaps:
 		options.mipmaps = !options.mipmaps
 		set_block_mipmaps(textures, options.mipmaps)
+		set_item_mipmaps(sprites, options.mipmaps)
 	case .TAA:
 		options.taa = !options.taa
 		taa.ready = false

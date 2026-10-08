@@ -17,4 +17,8 @@ msaa_resolve :: proc(msaa: ^MSAA, dest: c.uint, depth: bool) {}
 
 msaa_destroy :: proc(msaa: ^MSAA) {}
 
+clear_depth_buffer :: proc() -> bool {
+	return false
+}
+
 renderbuffer_free :: proc(id: u32) {}

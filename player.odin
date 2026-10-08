@@ -11,6 +11,15 @@ WALK_SPEED        :: 4.5
 GRAVITY           :: 32.0
 JUMP_SPEED        :: 9.0
 
+// Wading is a shallow pool with your feet on the floor. Swimming is everything
+// deeper, and it is slower. The hop is what gets you back onto the bank.
+WADE_SPEED  :: 2.6
+SWIM_SPEED  :: 3.0
+WATER_HOP   :: 6.0
+WATER_DRAG  :: 4.5
+// Pulls the eyes up to the water line. Clamped so a deep pool does not launch you.
+WATER_LIFT  :: 16.0
+
 // How quickly horizontal velocity settles, in 1/seconds. Getting up to speed
 // is quicker than stopping, so releasing the keys coasts about a block.
 // Air has no friction, and steering there is weaker, so a jump carries its speed.
@@ -71,13 +80,27 @@ simulate_player :: proc(player: ^Player, world: ^World, input: Move_Input) {
 	if input.left do wish += right
 	if input.back do wish -= forward
 	if input.right do wish -= right
+	surface, wet := body_in_water(world, player.position)
+	eye := player.position.y + PLAYER_EYE_HEIGHT
+	// Shallow water with solid ground under you is wading. Anything else wet is a swim.
+	wading := wet && player.grounded && eye > surface+0.02
+	swimming := wet && !wading
+
+	speed: f32 = WALK_SPEED
+	if swimming {
+		speed = SWIM_SPEED
+	} else if wading {
+		speed = WADE_SPEED
+	}
 	wish_length := math.sqrt(wish.x * wish.x + wish.y * wish.y)
 	if wish_length > 0 {
-		wish *= WALK_SPEED / wish_length
+		wish *= speed / wish_length
 	}
 
 	rate: f32
-	if player.grounded {
+	if swimming {
+		rate = 10
+	} else if player.grounded {
 		rate = GROUND_ACCEL if wish_length > 0 else FRICTION
 	} else if wish_length > 0 {
 		rate = AIR_ACCEL
@@ -86,9 +109,13 @@ simulate_player :: proc(player: ^Player, world: ^World, input: Move_Input) {
 		approach_horizontal(&player.velocity, wish, rate, input.dt)
 	}
 
-	player.velocity.y -= GRAVITY * input.dt
-	if player.grounded && input.jump {
-		player.velocity.y = JUMP_SPEED
+	if swimming {
+		swim_vertical(player, surface, input.jump, input.dt)
+	} else {
+		player.velocity.y -= GRAVITY * input.dt
+		if player.grounded && input.jump {
+			player.velocity.y = JUMP_SPEED
+		}
 	}
 
 	falling := player.velocity.y < 0
@@ -102,6 +129,71 @@ simulate_player :: proc(player: ^Player, world: ^World, input: Move_Input) {
 		player.velocity = {}
 		player.grounded = true
 	}
+}
+
+// Water the body is touching, and the Y of that water's top face.
+// A column the body only brushes still counts, which is what makes a shoreline
+// start to swim as soon as the bounding box enters it.
+body_in_water :: proc(world: ^World, position: [3]f32) -> (surface: f32, wet: bool) {
+	min, max := player_bounds(position)
+	x0 := block_index_horizontal(min.x)
+	x1 := block_index_horizontal(max.x - 0.001)
+	z0 := block_index_horizontal(min.z)
+	z1 := block_index_horizontal(max.z - 0.001)
+	y0 := block_index_vertical(min.y)
+	y1 := block_index_vertical(max.y - 0.001)
+
+	for x := x0; x <= x1; x += 1 {
+		for z := z0; z <= z1; z += 1 {
+			top := y0 - 1
+			for y := y0; y <= y1; y += 1 {
+				if get_block(world, x, y, z) == .Water {
+					top = y
+					break
+				}
+			}
+			if top < y0 {
+				continue
+			}
+			for _ in 0 ..< 48 {
+				if get_block(world, x, top+1, z) != .Water {
+					break
+				}
+				top += 1
+			}
+			face := f32(top + 1)
+			if !wet || face > surface {
+				surface = face
+				wet = true
+			}
+		}
+	}
+	if !wet {
+		return 0, false
+	}
+	depth := clamp(surface-min.y, 0, PLAYER_HEIGHT)
+	if depth <= 0.001 {
+		return 0, false
+	}
+	return surface, true
+}
+
+// Floats the eyes to just above the water line. Jump strokes upward, and a jump
+// that is already at the surface hops onto the bank instead of stroking in place.
+swim_vertical :: proc(player: ^Player, surface: f32, jump: bool, dt: f32) {
+	eye := player.position.y + PLAYER_EYE_HEIGHT
+	error := (surface - 0.05) - eye
+	if jump && error < 0.35 && player.velocity.y <= 0.5 {
+		player.velocity.y = WATER_HOP
+	} else if jump {
+		player.velocity.y += WATER_LIFT * dt
+	} else if error > 0 {
+		player.velocity.y += min(error, 2) * WATER_LIFT * dt
+	} else {
+		player.velocity.y += max(error, -0.35) * 8 * dt
+	}
+	player.velocity.y *= f32(math.exp(f64(-WATER_DRAG * dt)))
+	player.velocity.y = clamp(player.velocity.y, -4, WATER_HOP)
 }
 
 // One step of dv/dt = rate * (target - v). Exact for the frame's dt, so a long
@@ -189,6 +281,39 @@ camera_from_player :: proc(player: Player) -> rl.Camera3D {
 		fovy       = 70,
 		projection = .PERSPECTIVE,
 	}
+}
+
+// How far behind the eyes the third-person camera sits, and how far it stays
+// off a block it would otherwise enter. Closer than the hide distance, the
+// body is not drawn, because the camera is inside the head.
+THIRD_PERSON_DISTANCE :: f32(4)
+THIRD_PERSON_MARGIN   :: f32(0.3)
+THIRD_PERSON_HIDE     :: f32(0.85)
+
+// Same look direction as the first-person camera, pulled back along it.
+// A solid block shortens that pull so the view stays in the air.
+camera_behind :: proc(world: ^World, player: Player) -> (camera: rl.Camera3D, distance: f32) {
+	eye := player.position + {0, PLAYER_EYE_HEIGHT, 0}
+	look := look_direction(player.yaw, player.pitch)
+	back := -look
+	distance = THIRD_PERSON_DISTANCE
+	for t := f32(0.05); t <= THIRD_PERSON_DISTANCE; t += 0.05 {
+		p := eye + back*t
+		block := get_block(world, block_index_horizontal(p.x), block_index_vertical(p.y), block_index_horizontal(p.z))
+		if block_solid(block) {
+			distance = max(t-THIRD_PERSON_MARGIN, 0.15)
+			break
+		}
+	}
+	pos := eye + back*distance
+	camera = {
+		position   = pos,
+		target     = pos + look,
+		up         = {0, 1, 0},
+		fovy       = 70,
+		projection = .PERSPECTIVE,
+	}
+	return
 }
 
 // True when the body intersects this cell. Placement uses it so a solid block
