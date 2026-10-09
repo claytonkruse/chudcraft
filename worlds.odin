@@ -263,6 +263,9 @@ world_load :: proc(card: ^World_Card) -> (server: Server, reason: string) {
 	}
 	reader.i += name_len
 	server.seed = read_i64(&reader)
+	if reader.ok {
+		server.world.spawn_x, server.world.spawn_z = land_spawn(server.seed)
+	}
 	server.world.time = read_f64(&reader)
 	server.drop_rng = transmute(u64)read_i64(&reader)
 	if server.drop_rng == 0 {
@@ -485,7 +488,7 @@ read_saved_slot :: proc(reader: ^Reader) -> Slot {
 	kind := read_u8(reader)
 	block := read_u8(reader)
 	count := int(read_i32(reader))
-	if kind > u8(Item_Kind.Stone_Pickaxe) || block > u8(Block.Workbench) || count < 0 {
+	if kind > u8(Item_Kind.Iron_Ingot) || block > u8(Block.Oak_Door) || count < 0 {
 		reader.ok = false
 		return {}
 	}

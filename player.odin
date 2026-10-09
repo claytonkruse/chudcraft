@@ -1,10 +1,25 @@
 package main
 
+import "core:c"
 import "core:math"
+import b3 "vendor:box3d"
 import rl "vendor:raylib"
 
-PLAYER_HALF_WIDTH :: 0.3
-PLAYER_HEIGHT     :: 1.8
+// The vendor binding stores manifold points inline. The C function writes through
+// a pointer the caller provides, so this layout matches b3LocalManifold.
+Contact_Manifold :: struct {
+	normal:          b3.Vec3,
+	triangle_normal: b3.Vec3,
+	points:          [^]b3.LocalManifoldPoint,
+	point_count:     c.int,
+}
+
+#assert(offset_of(Contact_Manifold, points) == 24)
+#assert(offset_of(Contact_Manifold, point_count) == 32)
+
+// Vertical capsule: this radius, with hemispheres at the feet and the top of the head.
+PLAYER_RADIUS :: 0.3
+PLAYER_HEIGHT :: 1.8
 PLAYER_EYE_HEIGHT :: 1.62
 LOOK_SENSITIVITY  :: 0.003
 WALK_SPEED        :: 4.5
@@ -27,13 +42,10 @@ GROUND_ACCEL :: 8.0
 FRICTION     :: 12.0
 AIR_ACCEL    :: 8.0
 
-// The column the player spawns on and falls back to.
-SPAWN_X :: 0
-SPAWN_Z :: 0
-
-// Feet on whatever the surface is at that column, rather than a hardcoded height.
+// Feet on the meadow the seed chose, rather than a hardcoded height. The origin
+// is often ocean once biomes own the shape of the ground.
 spawn_position :: proc(world: ^World) -> [3]f32 {
-	return {f32(SPAWN_X), f32(surface_height(world, SPAWN_X, SPAWN_Z)), f32(SPAWN_Z)}
+	return {f32(world.spawn_x), f32(surface_height(world, world.spawn_x, world.spawn_z)), f32(world.spawn_z)}
 }
 
 Player :: struct {
@@ -80,7 +92,7 @@ simulate_player :: proc(player: ^Player, world: ^World, input: Move_Input) {
 	if input.left do wish += right
 	if input.back do wish -= forward
 	if input.right do wish -= right
-	surface, wet := body_in_water(world, player.position)
+	surface, wet, toward, foam := body_in_water(world, player.position, f32(world.time))
 	eye := player.position.y + PLAYER_EYE_HEIGHT
 	// Shallow water with solid ground under you is wading. Anything else wet is a swim.
 	wading := wet && player.grounded && eye > surface+0.02
@@ -117,6 +129,12 @@ simulate_player :: proc(player: ^Player, world: ^World, input: Move_Input) {
 			player.velocity.y = JUMP_SPEED
 		}
 	}
+	// A crest that is pitching shoreward shoves whatever is in the wash.
+	// toward is xz; its second component is Z.
+	if wet && foam > 0.35 {
+		player.velocity.x += toward.x * 11 * foam * input.dt
+		player.velocity.z += toward.y * 11 * foam * input.dt
+	}
 
 	falling := player.velocity.y < 0
 	hit := move_player(player, world, 1, player.velocity.y * input.dt)
@@ -131,10 +149,13 @@ simulate_player :: proc(player: ^Player, world: ^World, input: Move_Input) {
 	}
 }
 
-// Water the body is touching, and the Y of that water's top face.
-// A column the body only brushes still counts, which is what makes a shoreline
-// start to swim as soon as the bounding box enters it.
-body_in_water :: proc(world: ^World, position: [3]f32) -> (surface: f32, wet: bool) {
+// Water the body is touching, and the Y of that water's wave surface.
+// A crest lifts the body and a trough lets it down. The blocks never change.
+// A column the capsule only brushes still counts, which is what makes a shoreline
+// start to swim as soon as the body enters it.
+// toward points at the land the highest crest is breaking toward. foam is how
+// hard that crest is pitching. Both stay zero on flat water.
+body_in_water :: proc(world: ^World, position: [3]f32, time: f32) -> (surface: f32, wet: bool, toward: [2]f32, foam: f32) {
 	min, max := player_bounds(position)
 	x0 := block_index_horizontal(min.x)
 	x1 := block_index_horizontal(max.x - 0.001)
@@ -145,37 +166,89 @@ body_in_water :: proc(world: ^World, position: [3]f32) -> (surface: f32, wet: bo
 
 	for x := x0; x <= x1; x += 1 {
 		for z := z0; z <= z1; z += 1 {
-			top := y0 - 1
-			for y := y0; y <= y1; y += 1 {
-				if get_block(world, x, y, z) == .Water {
-					top = y
-					break
-				}
-			}
-			if top < y0 {
+			if cell_horiz_distance_sq(position.x, position.z, x, z) >= PLAYER_RADIUS*PLAYER_RADIUS {
 				continue
 			}
-			for _ in 0 ..< 48 {
-				if get_block(world, x, top+1, z) != .Water {
-					break
+			face, field, ok := column_wave(world, x, z, y0, y1, time, position.x, position.z)
+			if ok {
+				_, f := wave_height(position.x, position.z, time, field.shore, field.fetch)
+				if !wet || face > surface {
+					surface = face
+					wet = true
+					toward = field.toward
+					foam = f
 				}
-				top += 1
+				continue
 			}
-			face := f32(top + 1)
-			if !wet || face > surface {
-				surface = face
+			wash, dir, f, hit := shore_wash(world, x, z, min.y, time)
+			if !hit {
+				continue
+			}
+			if !wet || wash > surface {
+				surface = wash
 				wet = true
+				toward = dir
+				foam = f
 			}
 		}
 	}
 	if !wet {
-		return 0, false
+		return
 	}
 	depth := clamp(surface-min.y, 0, PLAYER_HEIGHT)
 	if depth <= 0.001 {
-		return 0, false
+		return
 	}
-	return surface, true
+	return
+}
+
+// A breaking crest runs a short way up the first land block, then pulls back.
+// Ankle deep, so the wash slows you without turning the beach into a swim.
+shore_wash :: proc(world: ^World, x, z: int, feet, time: f32) -> (y: f32, toward: [2]f32, foam: f32, ok: bool) {
+	ground := block_index_vertical(feet - 0.02)
+	if !solid(world, x, ground, z) {
+		return
+	}
+	top := f32(ground + 1)
+	if feet > top+0.35 {
+		return
+	}
+	best: f32
+	for dz in -1 ..= 1 {
+		for dx in -1 ..= 1 {
+			if dx == 0 && dz == 0 {
+				continue
+			}
+			nx := x + dx
+			nz := z + dz
+			if get_block(world, nx, ground, nz) != .Water &&
+			   get_block(world, nx, ground-1, nz) != .Water &&
+			   get_block(world, nx, ground+1, nz) != .Water {
+				continue
+			}
+			sample_x := f32(nx)
+			sample_z := f32(nz)
+			face, field, found := column_wave(world, nx, nz, ground-2, ground+2, time, sample_x, sample_z)
+			if !found || field.fetch < WAVE_MIN_FETCH {
+				continue
+			}
+			h, f := wave_height(sample_x, sample_z, time, field.shore, field.fetch)
+			if abs(face-h-top) > 1.25 || f < 0.4 {
+				continue
+			}
+			wash := top + 0.08 + 0.42*f
+			if !ok || wash > best {
+				best = wash
+				toward = field.toward
+				foam = f
+				ok = true
+			}
+		}
+	}
+	if !ok {
+		return
+	}
+	return best, toward, foam, true
 }
 
 // Floats the eyes to just above the water line. Jump strokes upward, and a jump
@@ -230,18 +303,20 @@ move_player :: proc(player: ^Player, world: ^World, axis: int, delta: f32) -> bo
 		for x := x0; x <= x1; x += 1 {
 			for y := y0; y <= y1; y += 1 {
 				for z := z0; z <= z1; z += 1 {
-					if !solid(world, x, y, z) {
+					bmin, bmax, shape, blocked_cell := block_hitbox(get_block(world, x, y, z), x, y, z)
+					if !blocked_cell {
 						continue
 					}
-					bmin := [3]f32{f32(x) - 0.5, f32(y), f32(z) - 0.5}
-					bmax := [3]f32{f32(x) + 0.5, f32(y) + 1, f32(z) + 0.5}
-					if separated(min, max, bmin, bmax, axis) {
-						continue
+					hull := unit_block_hull()
+					switch shape {
+					case .Full:
+					case .Thin_X:
+						hull = door_hull_x()
+					case .Thin_Z:
+						hull = door_hull_z()
 					}
-					if delta > 0 {
-						player.position[axis] -= max[axis] - bmin[axis]
-					} else {
-						player.position[axis] += bmax[axis] - min[axis]
+					if !capsule_push(player, bmin, bmax, axis, delta, hull) {
+						continue
 					}
 					hit = true
 					blocked = true
@@ -299,8 +374,10 @@ camera_behind :: proc(world: ^World, player: Player) -> (camera: rl.Camera3D, di
 	distance = THIRD_PERSON_DISTANCE
 	for t := f32(0.05); t <= THIRD_PERSON_DISTANCE; t += 0.05 {
 		p := eye + back*t
-		block := get_block(world, block_index_horizontal(p.x), block_index_vertical(p.y), block_index_horizontal(p.z))
-		if block_solid(block) {
+		bx := block_index_horizontal(p.x)
+		by := block_index_vertical(p.y)
+		bz := block_index_horizontal(p.z)
+		if block_contains(get_block(world, bx, by, bz), bx, by, bz, p) {
 			distance = max(t-THIRD_PERSON_MARGIN, 0.15)
 			break
 		}
@@ -316,25 +393,29 @@ camera_behind :: proc(world: ^World, player: Player) -> (camera: rl.Camera3D, di
 	return
 }
 
-// True when the body intersects this cell. Placement uses it so a solid block
+// True when the capsule intersects this cell. Placement uses it so a solid block
 // cannot be put where the player is standing.
 player_overlaps_block :: proc(player: Player, x, y, z: int) -> bool {
-	min, max := player_bounds(player.position)
 	bmin := [3]f32{f32(x) - 0.5, f32(y), f32(z) - 0.5}
 	bmax := [3]f32{f32(x) + 0.5, f32(y) + 1, f32(z) + 0.5}
-	return min.x < bmax.x && max.x > bmin.x &&
-		min.y < bmax.y && max.y > bmin.y &&
-		min.z < bmax.z && max.z > bmin.z
+	return player_overlaps_aabb(player, bmin, bmax)
 }
 
-player_bounds :: proc(position: [3]f32) -> (min, max: [3]f32) {
-	min = position + {-PLAYER_HALF_WIDTH, 0, -PLAYER_HALF_WIDTH}
-	max = position + {PLAYER_HALF_WIDTH, PLAYER_HEIGHT, PLAYER_HALF_WIDTH}
-	return
+player_overlaps_aabb :: proc(player: Player, bmin, bmax: [3]f32) -> bool {
+	return capsule_distance_sq(player.position, bmin, bmax) < PLAYER_RADIUS*PLAYER_RADIUS
 }
 
-// slack on the axes we are not moving along, so standing on a block
-// does not count as colliding with it while walking.
+// A point in the cell's collision, which for a door is the panel and not the gap.
+block_contains :: proc(block: Block, x, y, z: int, p: [3]f32) -> bool {
+	bmin, bmax, _, ok := block_hitbox(block, x, y, z)
+	if !ok {
+		return false
+	}
+	return p.x >= bmin.x && p.x <= bmax.x && p.y >= bmin.y && p.y <= bmax.y && p.z >= bmin.z && p.z <= bmax.z
+}
+
+// Slack on the axes a box is not moving along, so standing on a block does not
+// count as hitting it. Drops are boxes; the player uses the capsule instead.
 separated :: proc(min, max, bmin, bmax: [3]f32, axis: int) -> bool {
 	for a in 0 ..< 3 {
 		slack: f32 = 0.001 if a != axis else 0
@@ -343,4 +424,128 @@ separated :: proc(min, max, bmin, bmax: [3]f32, axis: int) -> bool {
 		}
 	}
 	return false
+}
+
+// The capsule's bounding box. The shape itself is round; this is only the search.
+player_bounds :: proc(position: [3]f32) -> (min, max: [3]f32) {
+	min = position + {-PLAYER_RADIUS, 0, -PLAYER_RADIUS}
+	max = position + {PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_RADIUS}
+	return
+}
+
+// Horizontal distance from a point to a block column's square.
+cell_horiz_distance_sq :: proc(px, pz: f32, x, z: int) -> f32 {
+	minx, maxx := f32(x)-0.5, f32(x)+0.5
+	minz, maxz := f32(z)-0.5, f32(z)+0.5
+	dx := px - clamp(px, minx, maxx)
+	dz := pz - clamp(pz, minz, maxz)
+	return dx*dx + dz*dz
+}
+
+// Distance from the capsule's core segment to a block. The segment runs between
+// the two sphere centers, so a result under the radius means the body hits.
+capsule_distance_sq :: proc(position, bmin, bmax: [3]f32) -> f32 {
+	dx := position.x - clamp(position.x, bmin.x, bmax.x)
+	dz := position.z - clamp(position.z, bmin.z, bmax.z)
+	horiz := dx*dx + dz*dz
+	lo := position.y + PLAYER_RADIUS
+	hi := position.y + PLAYER_HEIGHT - PLAYER_RADIUS
+	if hi < bmin.y {
+		dy := bmin.y - hi
+		return horiz + dy*dy
+	}
+	if lo > bmax.y {
+		dy := lo - bmax.y
+		return horiz + dy*dy
+	}
+	return horiz
+}
+
+// One unit block, centered on the origin. Offsets are relative, so the copy is safe.
+unit_block: b3.BoxHull
+unit_block_ready: bool
+door_box_x, door_box_z: b3.BoxHull
+door_hulls_ready: bool
+
+unit_block_hull :: proc() -> ^b3.HullData {
+	if !unit_block_ready {
+		unit_block = b3.MakeBoxHull(0.5, 0.5, 0.5)
+		unit_block_ready = true
+	}
+	return &unit_block.base
+}
+
+door_hulls_init :: proc() {
+	if door_hulls_ready {
+		return
+	}
+	door_box_x = b3.MakeBoxHull(DOOR_THICK*0.5, 0.5, 0.5)
+	door_box_z = b3.MakeBoxHull(0.5, 0.5, DOOR_THICK*0.5)
+	door_hulls_ready = true
+}
+
+door_hull_x :: proc() -> ^b3.HullData {
+	door_hulls_init()
+	return &door_box_x.base
+}
+
+door_hull_z :: proc() -> ^b3.HullData {
+	door_hulls_init()
+	return &door_box_z.base
+}
+
+// Pushes the capsule out of one block along the axis it just moved on.
+// The contact normal decides which axis owns the hit: a floor (normal along Y)
+// cannot throw the body across the block, and a wall cannot lift it onto a step.
+capsule_push :: proc(player: ^Player, bmin, bmax: [3]f32, axis: int, delta: f32, hull: ^b3.HullData) -> bool {
+	center := (bmin + bmax) * 0.5
+	feet := player.position
+	cap := b3.Capsule{
+		center1 = {feet.x - center.x, feet.y + PLAYER_RADIUS - center.y, feet.z - center.z},
+		center2 = {feet.x - center.x, feet.y + PLAYER_HEIGHT - PLAYER_RADIUS - center.y, feet.z - center.z},
+		radius  = PLAYER_RADIUS,
+	}
+	points: [2]b3.LocalManifoldPoint
+	manifold: Contact_Manifold
+	manifold.points = &points[0]
+	cache: b3.SimplexCache
+	// #by_ptr would hand the C function a copy of the hull header. The points live
+	// after that header, so the call has to see the hull in place.
+	Collide :: proc "c" (manifold: rawptr, capacity: c.int, hull, capsule: rawptr, transform: b3.Transform, cache: rawptr)
+	collide := transmute(Collide)b3.CollideHullAndCapsule
+	collide(&manifold, 2, hull, &cap, b3.Transform_identity, &cache)
+	if manifold.point_count <= 0 {
+		return false
+	}
+
+	sep: f32 = 0
+	overlapped := false
+	count := int(manifold.point_count)
+	if count > len(points) {
+		count = len(points)
+	}
+	for i in 0 ..< count {
+		s := points[i].separation
+		if s < sep {
+			sep = s
+			overlapped = true
+		}
+	}
+	// A positive separation is a speculative near-miss, not something to resolve.
+	if !overlapped {
+		return false
+	}
+
+	// Mostly this axis. A floor normal stays out of the horizontal passes.
+	n := manifold.normal[axis]
+	if abs(n) < 0.5 {
+		return false
+	}
+	shift := -sep / n
+	// Only undo the move that caused the overlap. Pushing the other way launches.
+	if shift*delta >= 0 {
+		return false
+	}
+	player.position[axis] += shift
+	return true
 }

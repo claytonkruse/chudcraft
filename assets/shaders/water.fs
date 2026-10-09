@@ -1,15 +1,12 @@
 #version 330
 
-// fragTexCoord.x is the block column across the quad. fragTexCoord.y is the block
-// row plus the atlas tile times 64, so a quad wider than one block can repeat
-// inside its own tile instead of sliding into the neighbor.
 in vec2 fragTexCoord;
 in vec4 fragColor;
 in vec3 fragWorld;
+in float fragFoam;
 
 uniform sampler2D texture0;
 uniform vec4 colDiffuse;
-uniform vec4 tiles[16];
 
 uniform vec3 sunDir;
 uniform vec3 moonDir;
@@ -39,7 +36,7 @@ float shadowAt(vec3 world, vec3 normal, float ndl) {
     vec2 uv = ndc.xy * 0.5 + 0.5;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
     float z = ndc.z * 0.5 + 0.5;
-    float bias = 0.0015 + 0.005 * (1.0 - clamp(ndl, 0.0, 1.0));
+    float bias = 0.002 + 0.006 * (1.0 - clamp(ndl, 0.0, 1.0));
     float shade = 0.0;
     for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
@@ -61,24 +58,17 @@ vec3 sunLight(vec3 world) {
     float shade = shadowAt(world, n, shadowOnSun > 0.5 ? ndl : ndm);
     float sunShade = shadowOnSun > 0.5 ? shade : 1.0;
     float moonShade = shadowOnSun > 0.5 ? 1.0 : shade;
-    // Tops stay bright while the sun is up, even when it is low. Direct sun
-    // still adds on top, and a shadow removes both.
     float lift = max(dot(n, upDir) - ndl, 0.0);
     return ambient + (sunColor * ndl + skyFill * lift) * sunShade + moonColor * ndm * moonShade;
 }
 
 void main() {
-    float tile = floor(fragTexCoord.y / 64.0);
-    float v = fragTexCoord.y - tile * 64.0;
-    float u = fragTexCoord.x;
-    float fu = u - floor(u);
-    float fv = v - floor(v);
-    if (fu == 0.0 && u > 0.0) fu = 1.0;
-    if (fv == 0.0 && v > 0.0) fv = 1.0;
-    vec4 rect = tiles[int(tile)];
-    vec2 uv = rect.xy + vec2(fu, fv) * rect.zw;
-    vec4 texel = texture(texture0, uv);
-    if (texel.a < 0.5) discard;
+    vec4 texel = texture(texture0, fragTexCoord);
     finalColor = texel * colDiffuse * fragColor;
     finalColor.rgb *= sunLight(fragWorld);
+    // The crest whitens as it pitches, and the lip stays white where the
+    // wave has already collapsed onto the bank.
+    float foam = clamp(fragFoam, 0.0, 1.0);
+    finalColor.rgb = mix(finalColor.rgb, vec3(0.78, 0.86, 0.88), foam);
+    finalColor.a = mix(finalColor.a, 1.0, foam * 0.65);
 }

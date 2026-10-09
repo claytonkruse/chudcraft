@@ -55,7 +55,7 @@ taa_destroy :: proc(taa: ^TAA) {
 // Jitters the projection and redirects world drawing. use_taa accumulates
 // frames; use_msaa draws into the 4x buffer first. Drawing happens between
 // this and taa_resolve.
-taa_begin :: proc(taa: ^TAA, msaa: ^MSAA, camera: rl.Camera3D, use_taa, use_msaa: bool) {
+taa_begin :: proc(taa: ^TAA, msaa: ^MSAA, camera: rl.Camera3D, use_taa, use_msaa: bool, clear: rl.Color) {
 	want_taa := use_taa && taa.shader.id != 0 && taa_ensure_targets(taa)
 	want_msaa := use_msaa && msaa.supported && msaa_ensure(msaa, rl.GetScreenWidth(), rl.GetScreenHeight())
 	taa.passthrough = !want_taa
@@ -63,7 +63,7 @@ taa_begin :: proc(taa: ^TAA, msaa: ^MSAA, camera: rl.Camera3D, use_taa, use_msaa
 
 	if want_msaa {
 		msaa_bind(msaa)
-		rl.ClearBackground(rl.SKYBLUE)
+		rl.ClearBackground(clear)
 		rl.BeginMode3D(camera)
 		if want_taa {
 			taa_jitter(taa)
@@ -77,7 +77,7 @@ taa_begin :: proc(taa: ^TAA, msaa: ^MSAA, camera: rl.Camera3D, use_taa, use_msaa
 	}
 
 	rl.BeginTextureMode(taa.scene)
-	rl.ClearBackground(rl.SKYBLUE)
+	rl.ClearBackground(clear)
 	rl.BeginMode3D(camera)
 	taa_jitter(taa)
 }

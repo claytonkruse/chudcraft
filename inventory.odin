@@ -139,17 +139,17 @@ inventory_room :: proc(slots: []Slot, item: Item) -> int {
 	return room
 }
 
-// Shift-click. The hotbar and the storage rows trade stacks. A crafting slot,
-// including its result, lands in the storage rows and stays off the hotbar.
+// Shift-click. The hotbar and the storage rows trade stacks. A crafted result
+// fills the hotbar first and uses the storage rows for what does not fit.
 inventory_shift :: proc(inv: ^Inventory, index: int) {
 	storage := inv.slots[HOTBAR_SLOTS:]
 	hotbar := inv.slots[:HOTBAR_SLOTS]
 	if index == CRAFT2_RESULT {
-		inventory_shift_craft(inv.craft2[:], 2, storage)
+		inventory_shift_craft(inv.craft2[:], 2, hotbar, storage)
 		return
 	}
 	if index == CRAFT3_RESULT {
-		inventory_shift_craft(inv.craft3[:], 3, storage)
+		inventory_shift_craft(inv.craft3[:], 3, hotbar, storage)
 		return
 	}
 	src, ok := inventory_slot_mut(inv, index)
@@ -168,9 +168,9 @@ inventory_shift :: proc(inv: ^Inventory, index: int) {
 	src.count = left
 }
 
-// Crafts as many times as the storage rows can hold, and leaves the rest of the
-// ingredients where they are.
-inventory_shift_craft :: proc(grid: []Slot, width: int, dest: []Slot) {
+// Crafts as many times as the hotbar and the storage rows can hold together.
+// The hotbar is filled first. Leftover ingredients stay in the grid.
+inventory_shift_craft :: proc(grid: []Slot, width: int, hotbar, storage: []Slot) {
 	item, count := craft_match(grid, width)
 	if count <= 0 || item_empty(item) {
 		return
@@ -191,7 +191,8 @@ inventory_shift_craft :: proc(grid: []Slot, width: int, dest: []Slot) {
 	if available <= 0 {
 		return
 	}
-	times := min(available, inventory_room(dest, item)/count)
+	room := inventory_room(hotbar, item) + inventory_room(storage, item)
+	times := min(available, room/count)
 	if times <= 0 {
 		return
 	}
@@ -204,7 +205,8 @@ inventory_shift_craft :: proc(grid: []Slot, width: int, dest: []Slot) {
 			slot = {}
 		}
 	}
-	inventory_add_slots(dest, item, times*count)
+	left := inventory_add_slots(hotbar, item, times*count)
+	inventory_add_slots(storage, item, left)
 }
 
 inventory_click_left :: proc(held, slot: ^Slot) {
@@ -477,6 +479,25 @@ inventory_place :: proc(inv: ^Inventory, player: Player, world: ^World, x, y, z:
 	if get_block(world, x, y, z) != .Air {
 		return
 	}
+	// A sapling only roots in dirt or grass. Anywhere else it would sit forever.
+	if slot.item.block == .Oak_Sapling {
+		ground := get_block(world, x, y-1, z)
+		if ground != .Dirt && ground != .Grass {
+			return
+		}
+	}
+	// A door takes the cell above as well, and refuses a spot the panel would
+	// share with the body. The item is one door, not two blocks.
+	if slot.item.block == .Oak_Door {
+		if !door_place(world, player, x, y, z) {
+			return
+		}
+		slot.count -= 1
+		if slot.count == 0 {
+			slot^ = {}
+		}
+		return
+	}
 	if block_solid(slot.item.block) && player_overlaps_block(player, x, y, z) {
 		return
 	}
@@ -638,7 +659,7 @@ inventory_slot_view :: proc(inv: Inventory, index: int) -> (slot: Slot, ok: bool
 	return {}, false
 }
 
-draw_inventory :: proc(font: rl.Font, renderer: ^Renderer, inv: Inventory, drag: Drag) {
+draw_inventory :: proc(font: rl.Font, renderer: ^Renderer, inv: Inventory, drag: Drag, player: Player, cycle: Walk_Cycle) {
 	layout := inventory_layout(inv.open, inv.table)
 	mouse := rl.GetMousePosition()
 	if inv.open {
@@ -646,7 +667,12 @@ draw_inventory :: proc(font: rl.Font, renderer: ^Renderer, inv: Inventory, drag:
 		rl.DrawRectangleRec(layout.panel, {24, 24, 24, 235})
 		rl.DrawRectangleLinesEx(layout.panel, 2, {80, 80, 80, 255})
 		rl.DrawRectangleRec(layout.preview, {14, 14, 14, 200})
-		draw_player_preview(renderer, layout.preview, mouse)
+		held: Item
+		slot := inv.slots[inv.selected]
+		if slot.count > 0 {
+			held = slot.item
+		}
+		draw_player_preview(renderer, layout.preview, mouse, player.yaw, cycle.body, cycle.phase, cycle.amount, held)
 		title: cstring = "Workbench" if inv.table else "Inventory"
 		rl.DrawTextEx(font, title, {layout.panel.x + PANEL_PAD, layout.panel.y + 12}, HUD_SIZE, HUD_SPACING, rl.WHITE)
 		if index, hovered := inventory_slot_at(mouse, inv.table); hovered {

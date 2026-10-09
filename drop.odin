@@ -182,12 +182,6 @@ drop_physics :: proc(drop: ^Drop, world: ^World, dt: f32) {
 	}
 }
 
-// Water counts as a floor so a drop lands on the surface instead of sinking.
-drop_blocked :: proc(world: ^World, x, y, z: int) -> bool {
-	block := get_block(world, x, y, z)
-	return block_solid(block) || block == .Water
-}
-
 drop_bounds :: proc(position: [3]f32) -> (min, max: [3]f32) {
 	min = position - DROP_HALF
 	max = position + DROP_HALF
@@ -211,14 +205,17 @@ drop_move :: proc(drop: ^Drop, world: ^World, axis: int, delta: f32) -> bool {
 		y1 := block_index_vertical(max.y - 0.001)
 		z0 := block_index_horizontal(min.z)
 		z1 := block_index_horizontal(max.z - 0.001)
-		for x := x0; x <= x1; x += 1 {
+		if axis == 1 && drop_on_wave(drop, world, min, max) {
+			hit = true
+			blocked = true
+		}
+		for x := x0; x <= x1 && !blocked; x += 1 {
 			for y := y0; y <= y1; y += 1 {
 				for z := z0; z <= z1; z += 1 {
-					if !drop_blocked(world, x, y, z) {
+					bmin, bmax, _, blocked_cell := block_hitbox(get_block(world, x, y, z), x, y, z)
+					if !blocked_cell {
 						continue
 					}
-					bmin := [3]f32{f32(x) - 0.5, f32(y), f32(z) - 0.5}
-					bmax := [3]f32{f32(x) + 0.5, f32(y) + 1, f32(z) + 0.5}
 					if separated(min, max, bmin, bmax, axis) {
 						continue
 					}
@@ -244,6 +241,39 @@ drop_move :: proc(drop: ^Drop, world: ^World, axis: int, delta: f32) -> bool {
 		}
 	}
 	return hit
+}
+
+// Lifts a cube onto the wave if it has reached the surface or is inside the
+// water column. A cube still in the air above the crest is left to fall.
+drop_on_wave :: proc(drop: ^Drop, world: ^World, min, max: [3]f32) -> bool {
+	time := f32(world.time)
+	x0 := block_index_horizontal(min.x)
+	x1 := block_index_horizontal(max.x - 0.001)
+	y0 := block_index_vertical(min.y)
+	y1 := block_index_vertical(max.y - 0.001)
+	z0 := block_index_horizontal(min.z)
+	z1 := block_index_horizontal(max.z - 0.001)
+	for x := x0; x <= x1; x += 1 {
+		for z := z0; z <= z1; z += 1 {
+			face, _, ok := column_wave(world, x, z, y0-2, y1, time, f32(x), f32(z))
+			if !ok || min.y >= face {
+				continue
+			}
+			inside := false
+			for y := y0; y <= y1; y += 1 {
+				if get_block(world, x, y, z) == .Water {
+					inside = true
+					break
+				}
+			}
+			if !inside && min.y < face-1.25 {
+				continue
+			}
+			drop.position.y += face - min.y
+			return true
+		}
+	}
+	return false
 }
 
 drop_merge :: proc(drops: ^[dynamic]Drop) {

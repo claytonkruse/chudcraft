@@ -24,6 +24,12 @@ Surface :: enum {
 	Oak_Planks,
 	Workbench_Top,
 	Workbench_Front,
+	Oak_Sapling,
+	Sand,
+	Gravel,
+	// Not in the atlas. A door is a thin panel with its own picture, both halves
+	// stacked in that one texture.
+	Oak_Door,
 }
 
 // Which draw pass a surface belongs to. Cutout keeps depth writes on and throws away
@@ -39,7 +45,7 @@ surface_pass :: proc(surface: Surface) -> Surface_Pass {
 	#partial switch surface {
 	case .Water:
 		return .Translucent
-	case .Oak_Leaves:
+	case .Oak_Leaves, .Oak_Sapling:
 		return .Cutout
 	}
 	return .Opaque
@@ -80,6 +86,19 @@ FACE_CORNER := [Face][4][3]f32 {
 @(rodata)
 FACE_UV := [4][2]f32{{0, 1}, {1, 1}, {1, 0}, {0, 0}}
 
+// Brightness of each face of a block item. The icon is baked with the sun off,
+// and the held cube is one small mesh, so this is what makes the sides read:
+// top full, Z sides a step down, X sides another, bottom half.
+@(rodata)
+FACE_LIGHT := [Face]f32{
+	.Pos_Y = 1,
+	.Neg_Y = 0.5,
+	.Pos_Z = 0.8,
+	.Neg_Z = 0.8,
+	.Pos_X = 0.6,
+	.Neg_X = 0.6,
+}
+
 // Plains grass color. The Faithful grass top is grayscale and gets multiplied by this.
 GRASS_TINT :: [4]u8{145, 189, 89, 255}
 
@@ -110,6 +129,10 @@ Block_Textures :: struct {
 	oak_planks:   rl.Texture2D,
 	workbench_top:   rl.Texture2D,
 	workbench_front: rl.Texture2D,
+	oak_sapling:     rl.Texture2D,
+	sand:            rl.Texture2D,
+	gravel:          rl.Texture2D,
+	oak_door:        rl.Texture2D,
 }
 
 // Flat pictures for sticks and tools. Blocks keep the cube icons.
@@ -119,6 +142,12 @@ Item_Sprites :: struct {
 	wood_pickaxe:   rl.Texture2D,
 	stone_shovel:   rl.Texture2D,
 	stone_pickaxe:  rl.Texture2D,
+	stone_axe:      rl.Texture2D,
+	wood_axe:       rl.Texture2D,
+	iron_shovel:    rl.Texture2D,
+	iron_pickaxe:   rl.Texture2D,
+	iron_axe:       rl.Texture2D,
+	iron_ingot:     rl.Texture2D,
 }
 
 // A chunk's geometry on the GPU, kept between frames and rebuilt only when the
@@ -134,6 +163,11 @@ Mesh_Build :: struct {
 	texcoords: [dynamic]f32,
 	colors:    [dynamic]u8,
 	indices:   [dynamic]u16,
+	// Water only. texcoords2 is (shore distance, open-water fetch).
+	// normals.xy points toward the nearest shore; normals.z is 1 on the
+	// free surface so the shader leaves every other vertex still.
+	texcoords2: [dynamic]f32,
+	normals:    [dynamic]f32,
 }
 
 Renderer :: struct {
@@ -144,15 +178,34 @@ Renderer :: struct {
 	// Shared by every cutout surface, which is why renderer_destroy cannot let
 	// UnloadMaterial free it.
 	cutout:    rl.Shader,
+	// Opaque drops and held blocks. Chunks use the atlas shader instead.
+	mesh_shader: rl.Shader,
+	water_shader: rl.Shader,
+	wave_time:    c.int,
+	atlas_light: Light_Locs,
+	cutout_light: Light_Locs,
+	mesh_light: Light_Locs,
+	water_light: Light_Locs,
+	shadow_shader: rl.Shader,
+	shadow_material: rl.Material,
+	shadow_target: rl.RenderTexture2D,
+	shadow_cutout: c.int,
+	stars: [STAR_COUNT]Star,
+	star_dot: rl.Texture2D,
 	// One picture per block, drawn in the hotbar and the inventory. Baked once;
 	// a slot redraws the picture, not the mesh.
 	icons:     [Block]rl.RenderTexture2D,
 	// The cube those pictures were drawn from, kept so a drop can spin in the world.
 	item_meshes: [Block]Chunk_Mesh,
 	sprites:   Item_Sprites,
+	// Ten crack pictures, indexed by how far the dig has gotten.
+	breaks:    [BREAK_STAGES]rl.Texture2D,
+	break_material: rl.Material,
 	// One upright quad and a material whose texture is swapped per item. The
 	// material must not own that texture, or unloading it would free the sprite.
+	// item_card is that picture extruded; the Z scale on the draw sets the thickness.
 	item_quad: rl.Mesh,
+	item_card: rl.Mesh,
 	item_material: rl.Material,
 	player:    Player_Model,
 	// Dirty chunks, nearest the player first. A frame meshes the ground underfoot
@@ -172,21 +225,30 @@ Renderer :: struct {
 }
 
 // A world chunk on the GPU: one greedy opaque mesh (split if the indices would
-// pass 65535), plus leaves and water, which stay one quad per face.
+// pass 65535), plus leaves and water. Water tops are subdivided so a wave
+// can bend inside a block.
 World_Mesh :: struct {
 	opaque: [dynamic]rl.Mesh,
 	leaves: [dynamic]rl.Mesh,
 	water:  [dynamic]rl.Mesh,
+	plants: [dynamic]rl.Mesh,
+	doors:  [dynamic]rl.Mesh,
 }
 
-ATLAS_COUNT :: 14
+ATLAS_COUNT :: 15
 ATLAS_PAD   :: 1
 
 renderer_init :: proc() -> Renderer {
 	renderer: Renderer
 	renderer.textures = load_block_textures()
 	// nil keeps raylib's default vertex shader, which is all this needs to replace.
-	renderer.cutout = rl.LoadShader(nil, "assets/shaders/cutout.fs")
+	renderer.cutout = rl.LoadShader("assets/shaders/world.vs", "assets/shaders/cutout.fs")
+	renderer.mesh_shader = rl.LoadShader("assets/shaders/world.vs", "assets/shaders/mesh.fs")
+	renderer.water_shader = rl.LoadShader("assets/shaders/water.vs", "assets/shaders/water.fs")
+	renderer.wave_time = -1
+	if renderer.water_shader.id != 0 {
+		renderer.wave_time = rl.GetShaderLocation(renderer.water_shader, "waveTime")
+	}
 
 	for surface in Surface {
 		material := rl.LoadMaterialDefault()
@@ -198,9 +260,27 @@ renderer_init :: proc() -> Renderer {
 		}
 		renderer.materials[surface] = material
 	}
+	for surface in Surface {
+		if surface_pass(surface) == .Opaque && renderer.mesh_shader.id != 0 {
+			renderer.materials[surface].shader = renderer.mesh_shader
+		}
+		if surface_pass(surface) == .Translucent && renderer.water_shader.id != 0 {
+			renderer.materials[surface].shader = renderer.water_shader
+		}
+	}
+	renderer.cutout_light = light_locs(renderer.cutout)
+	renderer.mesh_light = light_locs(renderer.mesh_shader)
+	renderer.water_light = light_locs(renderer.water_shader)
+	light_off := Sky{}
+	light_bind(renderer.cutout, renderer.cutout_light, light_off, rl.Matrix(1), 0, 0)
+	light_bind(renderer.mesh_shader, renderer.mesh_light, light_off, rl.Matrix(1), 0, 0)
+	light_bind(renderer.water_shader, renderer.water_light, light_off, rl.Matrix(1), 0, 0)
 	build_block_icons(&renderer)
 	renderer.sprites = load_item_sprites()
+	renderer.breaks = load_break_textures()
+	renderer.break_material = rl.LoadMaterialDefault()
 	renderer.item_quad = build_item_quad()
+	renderer.item_card = build_item_card()
 	renderer.item_material = rl.LoadMaterialDefault()
 	if renderer.cutout.id != 0 {
 		renderer.item_material.shader = renderer.cutout
@@ -237,6 +317,8 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 		delete(renderer.build[surface].texcoords)
 		delete(renderer.build[surface].colors)
 		delete(renderer.build[surface].indices)
+		delete(renderer.build[surface].texcoords2)
+		delete(renderer.build[surface].normals)
 	}
 
 	renderer.item_material.shader = {
@@ -248,7 +330,13 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 	if renderer.item_quad.vertexCount > 0 {
 		rl.UnloadMesh(renderer.item_quad)
 	}
+	if renderer.item_card.vertexCount > 0 {
+		rl.UnloadMesh(renderer.item_card)
+	}
 	unload_item_sprites(renderer.sprites)
+	rl.SetMaterialTexture(&renderer.break_material, .ALBEDO, {id = rlgl.GetTextureIdDefault()})
+	rl.UnloadMaterial(renderer.break_material)
+	unload_break_textures(renderer.breaks)
 
 	if renderer.atlas.id != 0 {
 		renderer.atlas_material.shader = {
@@ -260,6 +348,27 @@ renderer_destroy :: proc(renderer: ^Renderer) {
 	}
 	if renderer.cutout.id != 0 {
 		rl.UnloadShader(renderer.cutout)
+	}
+	if renderer.mesh_shader.id != 0 {
+		rl.UnloadShader(renderer.mesh_shader)
+	}
+	if renderer.water_shader.id != 0 {
+		rl.UnloadShader(renderer.water_shader)
+	}
+	renderer.shadow_material.shader = {
+		id   = rlgl.GetShaderIdDefault(),
+		locs = rlgl.GetShaderLocsDefault(),
+	}
+	rl.SetMaterialTexture(&renderer.shadow_material, .ALBEDO, {id = rlgl.GetTextureIdDefault()})
+	rl.UnloadMaterial(renderer.shadow_material)
+	if renderer.shadow_shader.id != 0 {
+		rl.UnloadShader(renderer.shadow_shader)
+	}
+	if renderer.shadow_target.id != 0 {
+		rl.UnloadRenderTexture(renderer.shadow_target)
+	}
+	if renderer.star_dot.id != 0 {
+		rl.UnloadTexture(renderer.star_dot)
 	}
 	for block in Block {
 		if renderer.icons[block].id != 0 {
@@ -309,7 +418,11 @@ draw_world :: proc(renderer: ^Renderer, world: ^World, camera: rl.Camera3D, focu
 
 // Water must not hide what is behind it. With depth writes off it also cannot hide
 // other water, which is what lets this pass skip sorting the meshes entirely.
-draw_water :: proc(renderer: ^Renderer) {
+draw_water :: proc(renderer: ^Renderer, time: f32) {
+	if renderer.water_shader.id != 0 && renderer.wave_time >= 0 {
+		t := time
+		rl.SetShaderValue(renderer.water_shader, renderer.wave_time, &t, .FLOAT)
+	}
 	rl.BeginBlendMode(.ALPHA)
 	rlgl.DisableDepthMask()
 	draw_world_meshes(renderer, .Translucent)
@@ -390,7 +503,10 @@ chunk_in_frustum :: proc(renderer: ^Renderer, key: [3]int) -> bool {
 		f32(key.y * CHUNK_SIZE),
 		f32(key.z * CHUNK_SIZE) - 0.5,
 	}
+	// Waves lift the top of a chunk by most of a block, and a trough drops it.
 	maxp := minp + CHUNK_SIZE
+	minp.y -= 1
+	maxp.y += 1
 	for plane in renderer.frustum {
 		x := maxp.x if plane[0] >= 0 else minp.x
 		y := maxp.y if plane[1] >= 0 else minp.y
@@ -429,6 +545,16 @@ draw_world_meshes :: proc(renderer: ^Renderer, pass: Surface_Pass) {
 		for part in list {
 			rl.DrawMesh(part, material, transform)
 		}
+		if pass == .Cutout {
+			for part in mesh.plants {
+				rl.DrawMesh(part, renderer.materials[.Oak_Sapling], transform)
+			}
+		}
+		if pass == .Opaque {
+			for part in mesh.doors {
+				rl.DrawMesh(part, renderer.materials[.Oak_Door], transform)
+			}
+		}
 	}
 }
 
@@ -461,11 +587,59 @@ build_chunk_mesh :: proc(renderer: ^Renderer, world: ^World, key: [3]int, out: ^
 	clear(&water.texcoords)
 	clear(&water.colors)
 	clear(&water.indices)
+	clear(&water.texcoords2)
+	clear(&water.normals)
+	plants := &renderer.build[.Oak_Sapling]
+	clear(&plants.vertices)
+	clear(&plants.texcoords)
+	clear(&plants.colors)
+	clear(&plants.indices)
+	doors := &renderer.build[.Oak_Door]
+	clear(&doors.vertices)
+	clear(&doors.texcoords)
+	clear(&doors.colors)
+	clear(&doors.indices)
 	unload_world_mesh(out)
 
 	chunk := world.chunks[key]
 	textured := renderer.textures.stone.id != 0
 	base := key * CHUNK_SIZE
+	shores: map[int]^Water_Shore
+	defer {
+		for _, shore in shores {
+			shore_destroy(shore)
+		}
+		delete(shores)
+	}
+
+	for lx in 0 ..< CHUNK_SIZE {
+		for ly in 0 ..< CHUNK_SIZE {
+			for lz in 0 ..< CHUNK_SIZE {
+				if chunk.blocks[lx][ly][lz] != .Oak_Sapling {
+					continue
+				}
+				if len(plants.indices)+24 > 65535 {
+					commit_mesh(plants, &out.plants)
+				}
+				append_cross(plants, f32(lx), f32(ly), f32(lz))
+			}
+		}
+	}
+
+	for lx in 0 ..< CHUNK_SIZE {
+		for ly in 0 ..< CHUNK_SIZE {
+			for lz in 0 ..< CHUNK_SIZE {
+				door, is_door := door_info(chunk.blocks[lx][ly][lz])
+				if !is_door {
+					continue
+				}
+				if len(doors.indices)+36 > 65535 {
+					commit_mesh(doors, &out.doors)
+				}
+				append_world_door(doors, lx, ly, lz, door)
+			}
+		}
+	}
 
 	for face in Face {
 		for slice in 0 ..< CHUNK_SIZE {
@@ -478,7 +652,7 @@ build_chunk_mesh :: proc(renderer: ^Renderer, world: ^World, key: [3]int, out: ^
 				for b in 0 ..< CHUNK_SIZE {
 					lx, ly, lz := slice_block(face, slice, a, b)
 					block := chunk.blocks[lx][ly][lz]
-					if block == .Air {
+					if block == .Air || block == .Oak_Sapling || block_is_door(block) {
 						continue
 					}
 					neighbor := mesh_neighbor(world, chunk, key, base, lx, ly, lz, face)
@@ -486,11 +660,14 @@ build_chunk_mesh :: proc(renderer: ^Renderer, world: ^World, key: [3]int, out: ^
 						continue
 					}
 					surface := block_surface(block, face)
+					if surface == .Water {
+						append_water_face(water, &out.water, world, &shores, base, lx, ly, lz, face, surface_tint(surface, textured))
+						continue
+					}
 					tile := atlas_tile(surface)
 					if tile < 0 {
-						build := leaves if surface == .Oak_Leaves else water
-						ensure_mesh_room(build, leaves_list(out, surface))
-						append_face(build, {f32(lx), f32(ly), f32(lz)}, face, surface_tint(surface, textured))
+						ensure_mesh_room(leaves, &out.leaves)
+						append_face(leaves, {f32(lx), f32(ly), f32(lz)}, face, surface_tint(surface, textured))
 						continue
 					}
 					tu, tv := face_tile_coord(face, lx, ly, lz)
@@ -505,6 +682,8 @@ build_chunk_mesh :: proc(renderer: ^Renderer, world: ^World, key: [3]int, out: ^
 	commit_mesh(opaque, &out.opaque)
 	commit_mesh(leaves, &out.leaves)
 	commit_mesh(water, &out.water)
+	commit_mesh(plants, &out.plants)
+	commit_mesh(doors, &out.doors)
 }
 
 slice_block :: proc(face: Face, slice, a, b: int) -> (x, y, z: int) {
@@ -642,6 +821,8 @@ commit_mesh :: proc(build: ^Mesh_Build, into: ^[dynamic]rl.Mesh) {
 	clear(&build.texcoords)
 	clear(&build.colors)
 	clear(&build.indices)
+	clear(&build.texcoords2)
+	clear(&build.normals)
 }
 
 upload_build :: proc(build: ^Mesh_Build) -> rl.Mesh {
@@ -652,6 +833,12 @@ upload_build :: proc(build: ^Mesh_Build) -> rl.Mesh {
 		texcoords     = clone_for_raylib(build.texcoords[:]),
 		colors        = clone_for_raylib(build.colors[:]),
 		indices       = clone_for_raylib(build.indices[:]),
+	}
+	if len(build.texcoords2) == len(build.vertices)/3*2 {
+		mesh.texcoords2 = clone_for_raylib(build.texcoords2[:])
+	}
+	if len(build.normals) == len(build.vertices) {
+		mesh.normals = clone_for_raylib(build.normals[:])
 	}
 	rl.UploadMesh(&mesh, false)
 	return mesh
@@ -667,12 +854,22 @@ unload_world_mesh :: proc(mesh: ^World_Mesh) {
 	for part in mesh.water {
 		rl.UnloadMesh(part)
 	}
+	for part in mesh.plants {
+		rl.UnloadMesh(part)
+	}
+	for part in mesh.doors {
+		rl.UnloadMesh(part)
+	}
 	delete(mesh.opaque)
 	delete(mesh.leaves)
 	delete(mesh.water)
+	delete(mesh.plants)
+	delete(mesh.doors)
 	mesh.opaque = nil
 	mesh.leaves = nil
 	mesh.water = nil
+	mesh.plants = nil
+	mesh.doors = nil
 }
 
 append_face :: proc(build: ^Mesh_Build, origin: [3]f32, face: Face, tint: [4]u8) {
@@ -686,6 +883,276 @@ append_face :: proc(build: ^Mesh_Build, origin: [3]f32, face: Face, tint: [4]u8)
 		append(&build.colors, tint[0], tint[1], tint[2], tint[3])
 	}
 	append(&build.indices, first, first + 1, first + 2, first, first + 2, first + 3)
+}
+
+// Quads per water top, along each edge. Enough samples for a breaker a few
+// blocks long without a mesh per wave.
+WATER_DIV :: 8
+
+// Shore field for one surface height in this chunk. Columns cover one past
+// the chunk on every side, so a vertex shared with the neighbor blends the
+// same four centers.
+Water_Shore :: struct {
+	x0, z0, n: int,
+	land_x:    []int,
+	land_z:    []int,
+	have:      []bool,
+	fetch:     []f32,
+}
+
+shore_destroy :: proc(shore: ^Water_Shore) {
+	delete(shore.land_x)
+	delete(shore.land_z)
+	delete(shore.have)
+	delete(shore.fetch)
+	free(shore)
+}
+
+// One mask for the whole chunk, then a land search per column. A vertex
+// blends the four centers around it, same as wave_field_at.
+build_shore :: proc(world: ^World, base_x, base_z, sy: int) -> ^Water_Shore {
+	n := CHUNK_SIZE + 2
+	span := n + WAVE_REACH*2
+	x0 := base_x - 1 - WAVE_REACH
+	z0 := base_z - 1 - WAVE_REACH
+	cell := make([]u8, span*span)
+	defer delete(cell)
+	wave_mask(world, x0, z0, sy, span, cell)
+	shore := new(Water_Shore)
+	shore.x0 = base_x - 1
+	shore.z0 = base_z - 1
+	shore.n = n
+	shore.land_x = make([]int, n*n)
+	shore.land_z = make([]int, n*n)
+	shore.have = make([]bool, n*n)
+	shore.fetch = make([]f32, n*n)
+	for iz in 0 ..< n {
+		for ix in 0 ..< n {
+			i := iz*n + ix
+			lx, lz, have, fetch := wave_column(shore.x0+ix, shore.z0+iz, x0, z0, span, cell)
+			shore.land_x[i] = lx
+			shore.land_z[i] = lz
+			shore.have[i] = have
+			shore.fetch[i] = fetch
+		}
+	}
+	return shore
+}
+
+take_shore :: proc(shores: ^map[int]^Water_Shore, world: ^World, base: [3]int, sy: int) -> ^Water_Shore {
+	if shore, ok := shores[sy]; ok {
+		return shore
+	}
+	shore := build_shore(world, base.x, base.z, sy)
+	shores[sy] = shore
+	return shore
+}
+
+shore_sample :: proc(shore: ^Water_Shore, wx, wz: int) -> Column_Land {
+	ix := wx - shore.x0
+	iz := wz - shore.z0
+	if ix < 0 {
+		ix = 0
+	} else if ix >= shore.n {
+		ix = shore.n - 1
+	}
+	if iz < 0 {
+		iz = 0
+	} else if iz >= shore.n {
+		iz = shore.n - 1
+	}
+	i := iz*shore.n + ix
+	return {
+		x = shore.land_x[i],
+		z = shore.land_z[i],
+		have = shore.have[i],
+		fetch = shore.fetch[i],
+	}
+}
+
+// Same blend as wave_field_at, from the columns this chunk already searched.
+shore_at :: proc(shore: ^Water_Shore, px, pz: f32) -> Wave_Field {
+	ix0 := int(math.floor(px))
+	iz0 := int(math.floor(pz))
+	tx := px - f32(ix0)
+	tz := pz - f32(iz0)
+	return blend_land(
+		px, pz, tx, tz,
+		shore_sample(shore, ix0, iz0),
+		shore_sample(shore, ix0+1, iz0),
+		shore_sample(shore, ix0, iz0+1),
+		shore_sample(shore, ix0+1, iz0+1),
+	)
+}
+
+append_water_vert :: proc(build: ^Mesh_Build, p: [3]f32, uv: [2]f32, tint: [4]u8, field: Wave_Field, surface: bool) {
+	append(&build.vertices, p.x, p.y, p.z)
+	append(&build.texcoords, uv.x, uv.y)
+	append(&build.colors, tint.x, tint.y, tint.z, tint.w)
+	if surface {
+		append(&build.texcoords2, field.shore, field.fetch)
+		append(&build.normals, field.toward.x, field.toward.y, 1)
+	} else {
+		append(&build.texcoords2, 0, 0)
+		append(&build.normals, 0, 0, 0)
+	}
+}
+
+append_water_face :: proc(build: ^Mesh_Build, into: ^[dynamic]rl.Mesh, world: ^World, shores: ^map[int]^Water_Shore, base: [3]int, lx, ly, lz: int, face: Face, tint: [4]u8) {
+	sy := base.y + ly
+	if face == .Pos_Y {
+		need := 6 * WATER_DIV * WATER_DIV
+		if len(build.indices)+need > 65535 {
+			commit_mesh(build, into)
+		}
+		shore := take_shore(shores, world, base, sy)
+		append_water_top(build, shore, base, lx, ly, lz, tint)
+		return
+	}
+	if len(build.indices)+6 > 65535 {
+		commit_mesh(build, into)
+	}
+	on_surface := water_surface(world, base.x+lx, sy, base.z+lz)
+	shore: ^Water_Shore
+	if on_surface {
+		shore = take_shore(shores, world, base, sy)
+	}
+	origin := [3]f32{f32(lx), f32(ly), f32(lz)}
+	corners := FACE_CORNER[face]
+	first := u16(len(build.vertices) / 3)
+	for i in 0 ..< 4 {
+		p := origin + corners[i]
+		field: Wave_Field
+		top := on_surface && corners[i].y == 1
+		if top {
+			wx := f32(base.x) - 0.5 + p.x
+			wz := f32(base.z) - 0.5 + p.z
+			field = shore_at(shore, wx, wz)
+		}
+		append_water_vert(build, p, FACE_UV[i], tint, field, top)
+	}
+	append(&build.indices, first, first+1, first+2, first, first+2, first+3)
+}
+
+append_water_top :: proc(build: ^Mesh_Build, shore: ^Water_Shore, base: [3]int, lx, ly, lz: int, tint: [4]u8) {
+	div := WATER_DIV
+	n := div + 1
+	first := u16(len(build.vertices) / 3)
+	for iz in 0 ..= div {
+		fz := f32(iz) / f32(div)
+		for ix in 0 ..= div {
+			fx := f32(ix) / f32(div)
+			local := [3]f32{f32(lx) + fx, f32(ly) + 1, f32(lz) + fz}
+			wx := f32(base.x) - 0.5 + local.x
+			wz := f32(base.z) - 0.5 + local.z
+			append_water_vert(build, local, {fx, fz}, tint, shore_at(shore, wx, wz), true)
+		}
+	}
+	row := u16(n)
+	for iz in 0 ..< div {
+		for ix in 0 ..< div {
+			i := first + u16(iz*n+ix)
+			a := i + row
+			b := a + 1
+			c := i + 1
+			append(&build.indices, a, b, c, a, c, i)
+		}
+	}
+}
+
+// Two crossed quads, each drawn from both sides. The picture's bottom sits on the
+// ground and its top reaches the top of the cell.
+append_cross :: proc(build: ^Mesh_Build, x, y, z: f32) {
+	append_quad(build, {x, y, z}, {x + 1, y, z + 1}, {x + 1, y + 1, z + 1}, {x, y + 1, z})
+	append_quad(build, {x + 1, y, z + 1}, {x, y, z}, {x, y + 1, z}, {x + 1, y + 1, z + 1})
+	append_quad(build, {x, y, z + 1}, {x + 1, y, z}, {x + 1, y + 1, z}, {x, y + 1, z + 1})
+	append_quad(build, {x + 1, y, z}, {x, y, z + 1}, {x, y + 1, z + 1}, {x + 1, y + 1, z})
+}
+
+append_quad :: proc(build: ^Mesh_Build, a, b, c, d: [3]f32) {
+	uvs := [4][2]f32{FACE_UV[0], FACE_UV[1], FACE_UV[2], FACE_UV[3]}
+	append_uv_quad(build, a, b, c, d, uvs, WHITE_TINT)
+}
+
+append_uv_quad :: proc(build: ^Mesh_Build, a, b, c, d: [3]f32, uvs: [4][2]f32, tint: [4]u8) {
+	first := u16(len(build.vertices) / 3)
+	corners := [4][3]f32{a, b, c, d}
+	for corner, i in corners {
+		append(&build.vertices, corner.x, corner.y, corner.z)
+		append(&build.texcoords, uvs[i].x, uvs[i].y)
+		append(&build.colors, tint.x, tint.y, tint.z, tint.w)
+	}
+	append(&build.indices, first, first + 1, first + 2, first, first + 2, first + 3)
+}
+
+// vb is the texture v at the bottom of this half, vt at the top. The picture
+// stacks the upper half of the door on the top of the image. flip puts the
+// latch edge of the picture opposite the hinge.
+append_world_door :: proc(build: ^Mesh_Build, lx, ly, lz: int, door: Door) {
+	min, max := door_cell_box(door)
+	origin := [3]f32{f32(lx), f32(ly), f32(lz)}
+	vb: f32 = 1
+	vt: f32 = 0.5
+	if door.upper {
+		vb = 0.5
+		vt = 0
+	}
+	append_door_panel(build, origin + min, origin + max, vb, vt, door_hinge_at_max(door), false)
+}
+
+append_door_panel :: proc(build: ^Mesh_Build, bmin, bmax: [3]f32, vb, vt: f32, flip, bake: bool) {
+	span := bmax - bmin
+	thin_x := span.x < span.z
+	for face in Face {
+		corner := FACE_CORNER[face]
+		pts: [4][3]f32
+		for i in 0 ..< 4 {
+			c := corner[i]
+			pts[i] = {
+				bmin.x + c.x * span.x,
+				bmin.y + c.y * span.y,
+				bmin.z + c.z * span.z,
+			}
+		}
+		large := (thin_x && (face == .Pos_X || face == .Neg_X)) || (!thin_x && (face == .Pos_Z || face == .Neg_Z))
+		uvs: [4][2]f32
+		if large {
+			uvs = door_large_uv(face, vb, vt, flip)
+		} else {
+			uvs = {{0.02, vb}, {0.08, vb}, {0.08, vt}, {0.02, vt}}
+		}
+		tint := WHITE_TINT
+		if bake {
+			tint = shade_tint(WHITE_TINT, face)
+		}
+		append_uv_quad(build, pts[0], pts[1], pts[2], pts[3], uvs, tint)
+	}
+}
+
+door_large_uv :: proc(face: Face, vb, vt: f32, flip: bool) -> (uvs: [4][2]f32) {
+	u: [4]f32
+	switch face {
+	case .Pos_Z:
+		u = {0, 1, 1, 0}
+	case .Neg_Z:
+		u = {1, 0, 0, 1}
+	case .Pos_X:
+		u = {1, 0, 0, 1}
+	case .Neg_X:
+		u = {0, 1, 1, 0}
+	case .Pos_Y, .Neg_Y:
+		u = {0, 1, 1, 0}
+	}
+	if flip {
+		for i in 0 ..< 4 {
+			u[i] = 1 - u[i]
+		}
+	}
+	v := [4]f32{vb, vb, vt, vt}
+	for i in 0 ..< 4 {
+		uvs[i] = {u[i], v[i]}
+	}
+	return
 }
 
 // Replaces one surface mesh with the scratch geometry and uploads it.
@@ -805,9 +1272,16 @@ build_icon_mesh :: proc(renderer: ^Renderer, block: Block, out: ^Chunk_Mesh) {
 		clear(&build.indices)
 	}
 	textured := renderer.textures.stone.id != 0
-	for face in Face {
-		surface := block_surface(block, face)
-		append_face(&renderer.build[surface], {-0.5, -0.5, -0.5}, face, surface_tint(surface, textured))
+	if block == .Oak_Sapling {
+		append_cross(&renderer.build[.Oak_Sapling], -0.5, -0.5, -0.5)
+	} else if block == .Oak_Door {
+		// One panel, both halves of the picture, so the slot reads as a door.
+		append_door_panel(&renderer.build[.Oak_Door], {-0.30, -0.72, -0.07}, {0.30, 0.72, 0.07}, 1, 0, false, true)
+	} else {
+		for face in Face {
+			surface := block_surface(block, face)
+			append_face(&renderer.build[surface], {-0.5, -0.5, -0.5}, face, shade_tint(surface_tint(surface, textured), face))
+		}
 	}
 	for surface in Surface {
 		upload_surface(out, surface, &renderer.build[surface])
@@ -875,6 +1349,95 @@ build_item_quad :: proc() -> rl.Mesh {
 	return mesh
 }
 
+// A unit box. The ±Z faces carry the whole sprite; the rim repeats its edge.
+// Scale Z by 1/16 to make a tool a sixteenth of a meter thick.
+build_item_card :: proc() -> rl.Mesh {
+	Corner :: struct {
+		p:  [3]f32,
+		uv: [2]f32,
+	}
+	faces := [6][4]Corner{
+		// Front, facing +Z.
+		{
+			{p = {-0.5, -0.5, 0.5}, uv = {0, 1}},
+			{p = {0.5, -0.5, 0.5}, uv = {1, 1}},
+			{p = {0.5, 0.5, 0.5}, uv = {1, 0}},
+			{p = {-0.5, 0.5, 0.5}, uv = {0, 0}},
+		},
+		// Back, facing -Z, so the picture still reads from behind the hand.
+		{
+			{p = {0.5, -0.5, -0.5}, uv = {0, 1}},
+			{p = {-0.5, -0.5, -0.5}, uv = {1, 1}},
+			{p = {-0.5, 0.5, -0.5}, uv = {1, 0}},
+			{p = {0.5, 0.5, -0.5}, uv = {0, 0}},
+		},
+		// Right edge of the sprite.
+		{
+			{p = {0.5, -0.5, 0.5}, uv = {1, 1}},
+			{p = {0.5, -0.5, -0.5}, uv = {1, 1}},
+			{p = {0.5, 0.5, -0.5}, uv = {1, 0}},
+			{p = {0.5, 0.5, 0.5}, uv = {1, 0}},
+		},
+		// Left edge.
+		{
+			{p = {-0.5, -0.5, -0.5}, uv = {0, 1}},
+			{p = {-0.5, -0.5, 0.5}, uv = {0, 1}},
+			{p = {-0.5, 0.5, 0.5}, uv = {0, 0}},
+			{p = {-0.5, 0.5, -0.5}, uv = {0, 0}},
+		},
+		// Top edge.
+		{
+			{p = {-0.5, 0.5, 0.5}, uv = {0, 0}},
+			{p = {0.5, 0.5, 0.5}, uv = {1, 0}},
+			{p = {0.5, 0.5, -0.5}, uv = {1, 0}},
+			{p = {-0.5, 0.5, -0.5}, uv = {0, 0}},
+		},
+		// Bottom edge.
+		{
+			{p = {-0.5, -0.5, -0.5}, uv = {0, 1}},
+			{p = {0.5, -0.5, -0.5}, uv = {1, 1}},
+			{p = {0.5, -0.5, 0.5}, uv = {1, 1}},
+			{p = {-0.5, -0.5, 0.5}, uv = {0, 1}},
+		},
+	}
+
+	vertices: [72]f32
+	texcoords: [48]f32
+	colors: [96]u8
+	indices: [36]u16
+	for face in 0 ..< 6 {
+		for corner in 0 ..< 4 {
+			i := face*4 + corner
+			vertices[i*3 + 0] = faces[face][corner].p.x
+			vertices[i*3 + 1] = faces[face][corner].p.y
+			vertices[i*3 + 2] = faces[face][corner].p.z
+			texcoords[i*2 + 0] = faces[face][corner].uv.x
+			texcoords[i*2 + 1] = faces[face][corner].uv.y
+			colors[i*4 + 0] = 255
+			colors[i*4 + 1] = 255
+			colors[i*4 + 2] = 255
+			colors[i*4 + 3] = 255
+		}
+		base := u16(face * 4)
+		indices[face*6 + 0] = base + 0
+		indices[face*6 + 1] = base + 1
+		indices[face*6 + 2] = base + 2
+		indices[face*6 + 3] = base + 0
+		indices[face*6 + 4] = base + 2
+		indices[face*6 + 5] = base + 3
+	}
+	mesh := rl.Mesh {
+		vertexCount   = 24,
+		triangleCount = 12,
+		vertices      = clone_for_raylib(vertices[:]),
+		texcoords     = clone_for_raylib(texcoords[:]),
+		colors        = clone_for_raylib(colors[:]),
+		indices       = clone_for_raylib(indices[:]),
+	}
+	rl.UploadMesh(&mesh, false)
+	return mesh
+}
+
 item_sprite :: proc(sprites: Item_Sprites, item: Item) -> rl.Texture2D {
 	switch item.kind {
 	case .Stick:
@@ -887,6 +1450,18 @@ item_sprite :: proc(sprites: Item_Sprites, item: Item) -> rl.Texture2D {
 		return sprites.stone_shovel
 	case .Stone_Pickaxe:
 		return sprites.stone_pickaxe
+	case .Wood_Axe:
+		return sprites.wood_axe
+	case .Stone_Axe:
+		return sprites.stone_axe
+	case .Iron_Shovel:
+		return sprites.iron_shovel
+	case .Iron_Pickaxe:
+		return sprites.iron_pickaxe
+	case .Iron_Axe:
+		return sprites.iron_axe
+	case .Iron_Ingot:
+		return sprites.iron_ingot
 	case .None, .Block:
 		return {}
 	}
@@ -951,6 +1526,16 @@ draw_item_sprite :: proc(renderer: ^Renderer, item: Item, transform: rl.Matrix) 
 	rl.DrawMesh(renderer.item_quad, renderer.item_material, transform)
 }
 
+// The same sprite as draw_item_sprite, with the thickness already in the transform.
+draw_item_card :: proc(renderer: ^Renderer, item: Item, transform: rl.Matrix) {
+	tex := item_sprite(renderer.sprites, item)
+	if tex.id == 0 || renderer.item_card.vertexCount == 0 {
+		return
+	}
+	rl.SetMaterialTexture(&renderer.item_material, .ALBEDO, tex)
+	rl.DrawMesh(renderer.item_card, renderer.item_material, transform)
+}
+
 draw_item_icon :: proc(renderer: ^Renderer, item: Item, dest: rl.Rectangle) {
 	if item.kind == .Block {
 		draw_block_icon(renderer, item.block, dest)
@@ -976,6 +1561,9 @@ draw_block_icon :: proc(renderer: ^Renderer, block: Block, dest: rl.Rectangle) {
 }
 
 block_surface :: proc(block: Block, face: Face) -> Surface {
+	if block_is_door(block) {
+		return .Oak_Door
+	}
 	switch block {
 	case .Grass:
 		switch face {
@@ -1007,6 +1595,12 @@ block_surface :: proc(block: Block, face: Face) -> Surface {
 		}
 	case .Oak_Leaves:
 		return .Oak_Leaves
+	case .Oak_Sapling:
+		return .Oak_Sapling
+	case .Sand:
+		return .Sand
+	case .Gravel:
+		return .Gravel
 	case .Oak_Planks:
 		return .Oak_Planks
 	case .Workbench:
@@ -1018,6 +1612,8 @@ block_surface :: proc(block: Block, face: Face) -> Surface {
 		case .Pos_X, .Neg_X, .Pos_Z, .Neg_Z:
 			return .Workbench_Front
 		}
+	case .Oak_Door:
+		return .Oak_Door
 	case .Stone, .Air:
 		return .Stone
 	}
@@ -1034,6 +1630,10 @@ surface_texture :: proc(textures: Block_Textures, surface: Surface) -> rl.Textur
 		return textures.dirt
 	case .Stone:
 		return textures.stone
+	case .Sand:
+		return textures.sand
+	case .Gravel:
+		return textures.gravel
 	case .Bedrock:
 		return textures.bedrock
 	case .Coal_Ore:
@@ -1056,8 +1656,23 @@ surface_texture :: proc(textures: Block_Textures, surface: Surface) -> rl.Textur
 		return textures.workbench_top
 	case .Workbench_Front:
 		return textures.workbench_front
+	case .Oak_Sapling:
+		return textures.oak_sapling
+	case .Oak_Door:
+		return textures.oak_door
 	}
 	return {}
+}
+
+// The surface color, scaled by that face's share of the light.
+shade_tint :: proc(tint: [4]u8, face: Face) -> [4]u8 {
+	s := FACE_LIGHT[face]
+	return {
+		u8(f32(tint[0]) * s + 0.5),
+		u8(f32(tint[1]) * s + 0.5),
+		u8(f32(tint[2]) * s + 0.5),
+		tint[3],
+	}
 }
 
 surface_tint :: proc(surface: Surface, textured: bool) -> [4]u8 {
@@ -1100,6 +1715,10 @@ surface_tint :: proc(surface: Surface, textured: bool) -> [4]u8 {
 		return {140, 110, 65, 255}
 	case .Workbench_Front:
 		return {122, 96, 56, 255}
+	case .Sand:
+		return {219, 201, 140, 255}
+	case .Gravel:
+		return {128, 128, 128, 255}
 	}
 	return WHITE_TINT
 }
@@ -1107,7 +1726,7 @@ surface_tint :: proc(surface: Surface, textured: bool) -> [4]u8 {
 // Opaque surfaces packed left to right. Water and leaves stay on their own textures.
 atlas_tile :: proc(surface: Surface) -> int {
 	#partial switch surface {
-	case .Water, .Oak_Leaves:
+	case .Water, .Oak_Leaves, .Oak_Sapling, .Oak_Door:
 		return -1
 	}
 	id := int(surface)
@@ -1115,6 +1734,9 @@ atlas_tile :: proc(surface: Surface) -> int {
 		id -= 1
 	}
 	if surface > .Oak_Leaves {
+		id -= 1
+	}
+	if surface > .Oak_Sapling {
 		id -= 1
 	}
 	return id
@@ -1126,6 +1748,9 @@ surface_from_tile :: proc(tile: int) -> Surface {
 		id += 1
 	}
 	if id >= int(Surface.Oak_Leaves) {
+		id += 1
+	}
+	if id >= int(Surface.Oak_Sapling) {
 		id += 1
 	}
 	return Surface(id)
@@ -1141,6 +1766,10 @@ atlas_file :: proc(surface: Surface) -> cstring {
 		return "assets/textures/dirt.png"
 	case .Stone:
 		return "assets/textures/stone.png"
+	case .Sand:
+		return "assets/textures/sand.png"
+	case .Gravel:
+		return "assets/textures/gravel.png"
 	case .Bedrock:
 		return "assets/textures/bedrock.png"
 	case .Coal_Ore:
@@ -1159,7 +1788,7 @@ atlas_file :: proc(surface: Surface) -> cstring {
 		return "assets/textures/workbench_top.png"
 	case .Workbench_Front:
 		return "assets/textures/workbench_front.png"
-	case .Water, .Oak_Leaves:
+	case .Water, .Oak_Leaves, .Oak_Sapling, .Oak_Door:
 		return nil
 	}
 	return nil
@@ -1215,7 +1844,21 @@ build_block_atlas :: proc(renderer: ^Renderer) {
 	if renderer.atlas_shader.id != 0 {
 		loc := rl.GetShaderLocation(renderer.atlas_shader, "tiles")
 		rl.SetShaderValueV(renderer.atlas_shader, loc, &renderer.atlas_tiles[0], .VEC4, ATLAS_COUNT)
+		renderer.atlas_light = light_locs(renderer.atlas_shader)
+		light_bind(renderer.atlas_shader, renderer.atlas_light, Sky{}, rl.Matrix(1), 0, 0)
 	}
+	renderer.shadow_shader = rl.LoadShader("assets/shaders/shadow.vs", "assets/shaders/shadow.fs")
+	renderer.shadow_cutout = rl.GetShaderLocation(renderer.shadow_shader, "cutout")
+	renderer.shadow_material = rl.LoadMaterialDefault()
+	if renderer.shadow_shader.id != 0 {
+		renderer.shadow_material.shader = renderer.shadow_shader
+	}
+	renderer.shadow_target = rl.LoadRenderTexture(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE)
+	if renderer.shadow_target.texture.id != 0 {
+		rl.SetTextureFilter(renderer.shadow_target.texture, .POINT)
+		rl.SetTextureWrap(renderer.shadow_target.texture, .CLAMP)
+	}
+	renderer.stars, renderer.star_dot = sky_init_stars()
 	renderer.atlas_material = rl.LoadMaterialDefault()
 	if renderer.atlas.id != 0 {
 		rl.SetMaterialTexture(&renderer.atlas_material, .ALBEDO, renderer.atlas)
@@ -1243,6 +1886,10 @@ load_block_textures :: proc() -> Block_Textures {
 		oak_planks     = rl.LoadTexture("assets/textures/oak_planks.png"),
 		workbench_top   = rl.LoadTexture("assets/textures/workbench_top.png"),
 		workbench_front = rl.LoadTexture("assets/textures/workbench_front.png"),
+		oak_sapling     = rl.LoadTexture("assets/textures/oak_sapling.png"),
+		sand            = rl.LoadTexture("assets/textures/sand.png"),
+		gravel          = rl.LoadTexture("assets/textures/gravel.png"),
+		oak_door        = rl.LoadTexture("assets/textures/oak_door.png"),
 	}
 	prepare_texture(&textures.grass_top)
 	prepare_texture(&textures.grass_side)
@@ -1259,6 +1906,10 @@ load_block_textures :: proc() -> Block_Textures {
 	prepare_texture(&textures.oak_planks)
 	prepare_texture(&textures.workbench_top)
 	prepare_texture(&textures.workbench_front)
+	prepare_texture(&textures.oak_sapling)
+	prepare_texture(&textures.sand)
+	prepare_texture(&textures.gravel)
+	prepare_texture(&textures.oak_door)
 	return textures
 }
 
@@ -1269,12 +1920,24 @@ load_item_sprites :: proc() -> Item_Sprites {
 		wood_pickaxe  = rl.LoadTexture("assets/textures/wooden_pickaxe.png"),
 		stone_shovel  = rl.LoadTexture("assets/textures/stone_shovel.png"),
 		stone_pickaxe = rl.LoadTexture("assets/textures/stone_pickaxe.png"),
+		wood_axe      = rl.LoadTexture("assets/textures/wooden_axe.png"),
+		stone_axe     = rl.LoadTexture("assets/textures/stone_axe.png"),
+		iron_shovel   = rl.LoadTexture("assets/textures/iron_shovel.png"),
+		iron_pickaxe  = rl.LoadTexture("assets/textures/iron_pickaxe.png"),
+		iron_axe      = rl.LoadTexture("assets/textures/iron_axe.png"),
+		iron_ingot    = rl.LoadTexture("assets/textures/iron_ingot.png"),
 	}
 	prepare_texture(&sprites.stick)
 	prepare_texture(&sprites.wood_shovel)
 	prepare_texture(&sprites.wood_pickaxe)
 	prepare_texture(&sprites.stone_shovel)
 	prepare_texture(&sprites.stone_pickaxe)
+	prepare_texture(&sprites.wood_axe)
+	prepare_texture(&sprites.stone_axe)
+	prepare_texture(&sprites.iron_shovel)
+	prepare_texture(&sprites.iron_pickaxe)
+	prepare_texture(&sprites.iron_axe)
+	prepare_texture(&sprites.iron_ingot)
 	return sprites
 }
 
@@ -1284,6 +1947,12 @@ unload_item_sprites :: proc(sprites: Item_Sprites) {
 	if sprites.wood_pickaxe.id != 0 do rl.UnloadTexture(sprites.wood_pickaxe)
 	if sprites.stone_shovel.id != 0 do rl.UnloadTexture(sprites.stone_shovel)
 	if sprites.stone_pickaxe.id != 0 do rl.UnloadTexture(sprites.stone_pickaxe)
+	if sprites.wood_axe.id != 0 do rl.UnloadTexture(sprites.wood_axe)
+	if sprites.stone_axe.id != 0 do rl.UnloadTexture(sprites.stone_axe)
+	if sprites.iron_shovel.id != 0 do rl.UnloadTexture(sprites.iron_shovel)
+	if sprites.iron_pickaxe.id != 0 do rl.UnloadTexture(sprites.iron_pickaxe)
+	if sprites.iron_axe.id != 0 do rl.UnloadTexture(sprites.iron_axe)
+	if sprites.iron_ingot.id != 0 do rl.UnloadTexture(sprites.iron_ingot)
 }
 
 // The chain has to exist before the filter is chosen. Raylib only selects a mip
@@ -1326,6 +1995,10 @@ set_block_mipmaps :: proc(textures: Block_Textures, atlas: rl.Texture2D, enabled
 	set(textures.oak_planks, filter)
 	set(textures.workbench_top, filter)
 	set(textures.workbench_front, filter)
+	set(textures.oak_sapling, filter)
+	set(textures.sand, filter)
+	set(textures.gravel, filter)
+	set(textures.oak_door, filter)
 	set(atlas, filter)
 }
 
@@ -1343,17 +2016,124 @@ set_item_mipmaps :: proc(sprites: Item_Sprites, enabled: bool) {
 	set(sprites.wood_pickaxe, filter)
 	set(sprites.stone_shovel, filter)
 	set(sprites.stone_pickaxe, filter)
+	set(sprites.wood_axe, filter)
+	set(sprites.stone_axe, filter)
+	set(sprites.iron_shovel, filter)
+	set(sprites.iron_pickaxe, filter)
+	set(sprites.iron_axe, filter)
+	set(sprites.iron_ingot, filter)
 }
 
 // Far enough in front of the block face that the wires win the depth test, close enough to still read as the block edge.
 HIGHLIGHT_BIAS :: 0.005
 
-draw_block_highlight :: proc(x, y, z: int, eye: [3]f32) {
+draw_block_highlight :: proc(x, y, z: int, eye: [3]f32, block: Block) {
 	center := [3]f32{f32(x), f32(y) + 0.5, f32(z)}
+	size := [3]f32{1, 1, 1}
+	if door, is_door := door_info(block); is_door {
+		bmin, bmax := door_aabb(x, y, z, door)
+		center = (bmin + bmax) * 0.5
+		size = bmax - bmin
+	}
 	to_eye := eye - center
 	length := math.sqrt(to_eye.x*to_eye.x + to_eye.y*to_eye.y + to_eye.z*to_eye.z)
 	if length > 0 {
 		center += to_eye * (HIGHLIGHT_BIAS / length)
 	}
-	rl.DrawCubeWires(center, 1, 1, 1, rl.BLACK)
+	rl.DrawCubeWires(center, size.x + HIGHLIGHT_BIAS*2, size.y + HIGHLIGHT_BIAS*2, size.z + HIGHLIGHT_BIAS*2, rl.BLACK)
+}
+
+BREAK_STAGES :: 10
+
+load_break_textures :: proc() -> [BREAK_STAGES]rl.Texture2D {
+	paths := [BREAK_STAGES]cstring {
+		"assets/textures/destroy_stage_0.png",
+		"assets/textures/destroy_stage_1.png",
+		"assets/textures/destroy_stage_2.png",
+		"assets/textures/destroy_stage_3.png",
+		"assets/textures/destroy_stage_4.png",
+		"assets/textures/destroy_stage_5.png",
+		"assets/textures/destroy_stage_6.png",
+		"assets/textures/destroy_stage_7.png",
+		"assets/textures/destroy_stage_8.png",
+		"assets/textures/destroy_stage_9.png",
+	}
+	textures: [BREAK_STAGES]rl.Texture2D
+	for path, i in paths {
+		textures[i] = rl.LoadTexture(path)
+		prepare_texture(&textures[i])
+	}
+	return textures
+}
+
+unload_break_textures :: proc(textures: [BREAK_STAGES]rl.Texture2D) {
+	for texture in textures {
+		if texture.id != 0 {
+			rl.UnloadTexture(texture)
+		}
+	}
+}
+
+// The crack sits a hair off each face so it wins the depth test against the block.
+CRACK_OUTSET :: f32(0.004)
+
+draw_break_cracks :: proc(renderer: ^Renderer, x, y, z, stage: int, block: Block) {
+	if stage < 0 || stage >= BREAK_STAGES || renderer.breaks[stage].id == 0 || renderer.item_quad.vertexCount == 0 {
+		return
+	}
+	if door, is_door := door_info(block); is_door {
+		bmin, bmax := door_aabb(x, y, z, door)
+		draw_door_cracks(renderer, bmin, bmax, stage)
+		return
+	}
+	center := [3]f32{f32(x), f32(y) + 0.5, f32(z)}
+	out := 0.5 + CRACK_OUTSET
+	faces := [6]rl.Matrix {
+		rl.MatrixTranslate(center.x, center.y, center.z + out),
+		rl.MatrixTranslate(center.x, center.y, center.z - out) * rl.MatrixRotateY(math.PI),
+		rl.MatrixTranslate(center.x + out, center.y, center.z) * rl.MatrixRotateY(math.PI * 0.5),
+		rl.MatrixTranslate(center.x - out, center.y, center.z) * rl.MatrixRotateY(-math.PI * 0.5),
+		rl.MatrixTranslate(center.x, center.y + out, center.z) * rl.MatrixRotateX(-math.PI * 0.5),
+		rl.MatrixTranslate(center.x, center.y - out, center.z) * rl.MatrixRotateX(math.PI * 0.5),
+	}
+	rl.SetMaterialTexture(&renderer.break_material, .ALBEDO, renderer.breaks[stage])
+	rl.BeginBlendMode(.ALPHA)
+	rlgl.DisableDepthMask()
+	rlgl.DisableBackfaceCulling()
+	for face in faces {
+		rl.DrawMesh(renderer.item_quad, renderer.break_material, face)
+	}
+	rlgl.EnableBackfaceCulling()
+	rlgl.EnableDepthMask()
+	rl.EndBlendMode()
+}
+
+// The two broad faces of the panel. The crack quad faces +Z and is a meter wide,
+// so it is scaled to the panel and turned when the panel faces X.
+draw_door_cracks :: proc(renderer: ^Renderer, bmin, bmax: [3]f32, stage: int) {
+	sx := bmax.x - bmin.x
+	sy := bmax.y - bmin.y
+	sz := bmax.z - bmin.z
+	center := (bmin + bmax) * 0.5
+	bias := CRACK_OUTSET
+	faces: [2]rl.Matrix
+	if sx < sz {
+		scale := rl.MatrixScale(sz, sy, 1)
+		faces[0] = rl.MatrixTranslate(bmax.x + bias, center.y, center.z) * rl.MatrixRotateY(math.PI * 0.5) * scale
+		faces[1] = rl.MatrixTranslate(bmin.x - bias, center.y, center.z) * rl.MatrixRotateY(-math.PI * 0.5) * scale
+	} else {
+		scale := rl.MatrixScale(sx, sy, 1)
+		faces[0] = rl.MatrixTranslate(center.x, center.y, bmax.z + bias) * scale
+		faces[1] = rl.MatrixTranslate(center.x, center.y, bmin.z - bias) * rl.MatrixRotateY(math.PI) * scale
+	}
+	rl.SetMaterialTexture(&renderer.break_material, .ALBEDO, renderer.breaks[stage])
+	rl.BeginBlendMode(.ALPHA)
+	rlgl.DisableDepthMask()
+	rlgl.DisableBackfaceCulling()
+	for face in faces {
+		rl.DrawMesh(renderer.item_quad, renderer.break_material, face)
+	}
+	rlgl.EnableBackfaceCulling()
+	rlgl.EnableDepthMask()
+	rl.EndBlendMode()
 }

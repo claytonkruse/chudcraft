@@ -16,7 +16,7 @@ import "core:net"
 // mobile-device service, so hosting there always looks like the port is ours.
 NET_PORT        :: 43720
 NET_PORT_TRIES  :: 16
-NET_VERSION     :: u32(8)
+NET_VERSION     :: u32(14)
 NET_MAX_PLAYERS :: 8
 // A chunk message is a few kilobytes. Anything larger is a broken peer.
 NET_MAX_MESSAGE :: 8 * 1024 * 1024
@@ -698,6 +698,7 @@ apply_state :: proc(client: ^Client, payload: []u8) -> bool {
 			position = {read_f32(&reader), read_f32(&reader), read_f32(&reader)},
 			yaw = read_f32(&reader),
 			pitch = read_f32(&reader),
+			held = read_item(&reader),
 		})
 	}
 
@@ -720,15 +721,24 @@ apply_state :: proc(client: ^Client, payload: []u8) -> bool {
 	if !reader.ok || changes < 0 || changes > 100000 {
 		return false
 	}
+	// Position was copied above. Aim before the edits so a break is heard from here.
+	sound_listen(client.player)
 	for _ in 0 ..< changes {
 		x := int(read_i32(&reader))
 		y := int(read_i32(&reader))
 		z := int(read_i32(&reader))
 		block := read_block(&reader)
+		audible := read_u8(&reader) != 0
 		if !reader.ok {
 			return false
 		}
+		old := get_block(&client.world, x, y, z)
 		store_block(&client.world, x, y, z, block)
+		sound_changed(&client.world, x, y, z, old, block, audible)
+	}
+	client.sky_time = read_f64(&reader)
+	if !read_chat_notes(client, &reader) {
+		return false
 	}
 	return reader.ok && reader.i == len(payload)
 }
@@ -786,6 +796,7 @@ write_state :: proc(buf: ^[dynamic]u8, server: ^Server, self: u32) {
 		write_f32(buf, other.player.position.z)
 		write_f32(buf, other.player.yaw)
 		write_f32(buf, other.player.pitch)
+		write_item(buf, equipped_item(&other.inventory))
 	}
 
 	write_u32(buf, u32(len(server.drops)))
@@ -805,7 +816,11 @@ write_state :: proc(buf: ^[dynamic]u8, server: ^Server, self: u32) {
 		write_i32(buf, i32(change.y))
 		write_i32(buf, i32(change.z))
 		append(buf, u8(change.block))
+		// Growth and decay travel the same list. Only a player's edit is played.
+		append(buf, u8(1) if change.audible else 0)
 	}
+	write_f64(buf, server.world.time)
+	write_chat_notes(buf, server, self)
 }
 
 write_input :: proc(buf: ^[dynamic]u8, input: Client_Input) {
@@ -842,6 +857,18 @@ write_input :: proc(buf: ^[dynamic]u8, input: Client_Input) {
 		write_i32(buf, i32(input.table_z))
 	}
 	append(buf, u8(render_radius(input.render_distance)))
+	n := input.say_n
+	if n < 0 {
+		n = 0
+	}
+	if n > CHAT_LINE {
+		n = CHAT_LINE
+	}
+	append(buf, u8(n))
+	if n > 0 {
+		said := input.say
+		append(buf, ..said[:n])
+	}
 }
 
 read_input :: proc(reader: ^Reader) -> Client_Input {
@@ -880,6 +907,15 @@ read_input :: proc(reader: ^Reader) -> Client_Input {
 		input.table_z = int(read_i32(reader))
 	}
 	input.render_distance = int(read_u8(reader))
+	n := int(read_u8(reader))
+	if n > CHAT_LINE {
+		reader.ok = false
+		return input
+	}
+	input.say_n = n
+	for i in 0 ..< n {
+		input.say[i] = read_u8(reader)
+	}
 	return input
 }
 
@@ -904,7 +940,7 @@ write_item :: proc(buf: ^[dynamic]u8, item: Item) {
 read_item :: proc(reader: ^Reader) -> Item {
 	kind_raw := read_u8(reader)
 	block_raw := read_u8(reader)
-	if kind_raw > u8(Item_Kind.Stone_Pickaxe) {
+	if kind_raw > u8(Item_Kind.Iron_Ingot) {
 		reader.ok = false
 		return {}
 	}
@@ -912,7 +948,7 @@ read_item :: proc(reader: ^Reader) -> Item {
 	if kind != .Block {
 		return {kind = kind}
 	}
-	if block_raw > u8(Block.Workbench) {
+	if block_raw > u8(Block.Oak_Door) {
 		reader.ok = false
 		return {}
 	}
@@ -921,7 +957,9 @@ read_item :: proc(reader: ^Reader) -> Item {
 
 read_block :: proc(reader: ^Reader) -> Block {
 	raw := read_u8(reader)
-	if raw > u8(Block.Workbench) {
+	// Door cells pack facing and hinge into the ids after Oak_Door. The item
+	// itself is only Oak_Door; those extra ids are world cells, read here.
+	if raw > u8(Block.Oak_Door) + DOOR_VARIANTS - 1 {
 		reader.ok = false
 		return .Air
 	}

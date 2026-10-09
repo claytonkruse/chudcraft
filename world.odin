@@ -17,6 +17,12 @@ Block :: enum u8 {
 	Oak_Leaves,
 	Oak_Planks,
 	Workbench,
+	Oak_Sapling,
+	Sand,
+	Gravel,
+	// Item id, and the first of the 32 packed door cells that follow it.
+	// door.odin owns that range. The next real block starts after it.
+	Oak_Door,
 }
 
 // A power of two, so splitting a world coordinate is a shift and a mask.
@@ -65,6 +71,9 @@ World :: struct {
 	// Block edits recorded for clients. Generation leaves this off, then the
 	// server turns it on so only play is replicated.
 	record:  bool,
+	// Set for the one edit a player caused. Growth writes blocks through the
+	// same path, and those must not be played back as breaks and places.
+	hear:    bool,
 	changes: [dynamic]Block_Change,
 	// Generation sets this and appends each touched chunk to sync_queue, so a
 	// column is copied once instead of one change per block.
@@ -77,6 +86,9 @@ World :: struct {
 	meshing:    bool,
 	// Edits and deadlines parked by column, so walking back restores that column only.
 	cold:       map[[2]int][dynamic]Cold_Piece,
+	// Where a new player stands. Derived from the seed, because the origin can
+	// be ocean. Filled in when the world is created or loaded.
+	spawn_x, spawn_z: int,
 	// While set, generation only writes this column. A kept chunk is one that
 	// was restored, and this pass must not overwrite it.
 	gen_clip:   bool,
@@ -87,6 +99,8 @@ World :: struct {
 Block_Change :: struct {
 	x, y, z: int,
 	block:   Block,
+	// A player broke or placed this. Leaf decay and a spreading lawn stay false.
+	audible: bool,
 }
 
 world_destroy :: proc(world: ^World) {
@@ -141,13 +155,16 @@ set_block_at :: proc(world: ^World, x, y, z: int, block: Block, at: f64) {
 	}
 	reschedule(world, x, y, z, at)
 	// Opening or closing the block above is what makes the dirt underneath
-	// eligible for grass, or takes that eligibility away.
-	if get_block(world, x, y-1, z) == .Dirt {
+	// eligible for grass, or takes that eligibility away. Grass underneath
+	// gains or loses its trample date the same way.
+	below := get_block(world, x, y-1, z)
+	if below == .Dirt || below == .Grass {
 		reschedule(world, x, y-1, z, at)
 	}
 	// Leaves remember whether they can reach a log. A new one can complete a
 	// path that an earlier leaf could not see yet, and removing one can break it.
 	leaves_after_change(world, x, y, z, old, block, at)
+	door_settle(world, x, y, z)
 }
 
 // Writes one cell and marks the meshes that show it. No growth scheduling: the
@@ -198,7 +215,7 @@ store_block :: proc(world: ^World, x, y, z: int, block: Block) -> (old: Block, w
 	}
 	if world.record {
 		chunk.edited = true
-		append(&world.changes, Block_Change{x = x, y = y, z = z, block = block})
+		append(&world.changes, Block_Change{x = x, y = y, z = z, block = block, audible = world.hear})
 	}
 	return old, true
 }
@@ -270,24 +287,37 @@ note_sync :: proc(world: ^World, key: [3]int, chunk: ^Chunk) {
 	append(&world.sync_queue, key)
 }
 
-// Whether a block stops the player, which is also what the break ray stops on.
+// Whether a block stops the player. The break ray uses block_targetable, which
+// also stops on a sapling.
 solid :: proc(world: ^World, x, y, z: int) -> bool {
 	return block_solid(get_block(world, x, y, z))
 }
 
 // Hides the face of whatever is next to it, so the mesher can skip that face.
 block_opaque :: proc(block: Block) -> bool {
+	if block_is_door(block) {
+		return false
+	}
 	#partial switch block {
-	case .Air, .Water, .Oak_Leaves:
+	case .Air, .Water, .Oak_Leaves, .Oak_Sapling:
 		return false
 	}
 	return true
 }
 
-// Stops the player. Water does not, which also means the break ray passes straight
-// through it rather than letting water be mined.
+// Stops the player. Water does not. A sapling does not either: it is a plant,
+// and the break ray still stops on it.
 block_solid :: proc(block: Block) -> bool {
-	return block != .Air && block != .Water
+	// A door is a panel, not a cube. Collision asks block_hitbox for the sliver.
+	if block_is_door(block) {
+		return false
+	}
+	return block != .Air && block != .Water && block != .Oak_Sapling
+}
+
+// What the break ray and the crosshair stop on.
+block_targetable :: proc(block: Block) -> bool {
+	return block_solid(block) || block == .Oak_Sapling
 }
 
 // Bedrock is the floor of the world, so it has to stay put.
@@ -347,7 +377,15 @@ raycast_block :: proc(world: ^World, origin, direction: [3]f32, reach: f32) -> (
 		if distance > reach {
 			break
 		}
-		if solid(world, cell.x, cell.y, cell.z) {
+		block := get_block(world, cell.x, cell.y, cell.z)
+		// The empty part of a door cell is air to the ray, so an open door can
+		// be looked through at the block behind it.
+		if door, is_door := door_info(block); is_door {
+			bmin, bmax := door_aabb(cell.x, cell.y, cell.z, door)
+			if ray_hit_box(origin, dir, bmin, bmax, reach) {
+				return true, cell.x, cell.y, cell.z, prev.x, prev.y, prev.z
+			}
+		} else if block_targetable(block) {
 			return true, cell.x, cell.y, cell.z, prev.x, prev.y, prev.z
 		}
 

@@ -4,9 +4,13 @@ import "core:math"
 import "core:math/noise"
 import "core:math/rand"
 
-// World generation. While a column is being filled it writes the chunk array
-// directly. Grass and leaves are scheduled once the column is complete.
-// Nothing here knows how a block is drawn.
+// World generation. The biome is chosen first, from climate noise, and the
+// height of a column is that biome's own relief. A shore is flat because it is
+// a beach, and a peak is tall because it is a mountain. Neighboring biomes
+// blend, so the ground changes shape across a border instead of stepping.
+// While a column is being filled it writes the chunk array directly. Grass and
+// leaves are scheduled once the column is complete. Nothing here knows how a
+// block is drawn.
 
 // A new world each launch. rand.uint64 is lazily seeded from the OS, so this is
 // just "pick a 64-bit number"; the generator itself stays deterministic for that number.
@@ -44,16 +48,56 @@ unload_radius :: proc(radius: int) -> int {
 }
 
 BEDROCK_DEPTH :: 2 // y 0 is always bedrock, y 1 is the jagged band.
-DIRT_DEPTH    :: 3
 
-TERRAIN_BASE      :: 64    // The height the noise varies around.
-TERRAIN_AMPLITUDE :: 14    // Peak-to-base, in blocks.
-TERRAIN_SCALE     :: 220.0 // Blocks per noise unit, so larger is smoother.
-TERRAIN_OCTAVES   :: 4
-
-// Below TERRAIN_BASE, so only genuine low ground floods. The gap between the two is the
-// only knob that decides how much water the world has.
+// One sea for the whole world. Oceans sit under it because their relief is
+// low, and beaches sit on it because theirs is flat. Land relief is what
+// decides how much of a biome is dry.
 WATER_LEVEL :: 58
+
+// Climate is sampled on this scale, in blocks. Larger biomes, softer borders.
+CLIMATE_SCALE :: 480.0
+
+// The blocks the texture pack can actually show. Climate picks one of these
+// before any height is computed, and the relief below is that biome's shape.
+Biome :: enum u8 {
+	Ocean,
+	Beach,
+	Plains,
+	Forest,
+	Desert,
+	Barrens,
+	Hills,
+	Mountains,
+}
+
+Relief_Kind :: enum u8 {
+	Rolling, // Broad hills.
+	Dunes,   // Absolute noise, so the crests are sand waves.
+	Ridged,  // Inverted absolute noise, so the crests are ridges.
+}
+
+Biome_Shape :: struct {
+	base:      f32,
+	amplitude: f32,
+	scale:     f32,
+	octaves:   int,
+	kind:      Relief_Kind,
+}
+
+// Bases are what make an ocean a bowl and a mountain a peak. Amplitude and
+// scale are what make a desert a dune field and a plains a lawn. None of
+// these are applied until the biome weights exist.
+@(rodata)
+BIOME_SHAPE := [Biome]Biome_Shape {
+	.Ocean     = {base = 40, amplitude = 8, scale = 200, octaves = 3, kind = .Rolling},
+	.Beach     = {base = 60, amplitude = 1.2, scale = 90, octaves = 2, kind = .Rolling},
+	.Plains    = {base = 64, amplitude = 3.5, scale = 340, octaves = 3, kind = .Rolling},
+	.Forest    = {base = 67, amplitude = 11, scale = 150, octaves = 4, kind = .Rolling},
+	.Desert    = {base = 65, amplitude = 8, scale = 58, octaves = 3, kind = .Dunes},
+	.Barrens   = {base = 71, amplitude = 7, scale = 110, octaves = 3, kind = .Rolling},
+	.Hills     = {base = 82, amplitude = 14, scale = 150, octaves = 4, kind = .Rolling},
+	.Mountains = {base = 102, amplitude = 26, scale = 210, octaves = 4, kind = .Ridged},
+}
 
 // Which columns are finished. A finished column already has its water, ore, and
 // trees; later columns do not come back and edit it. loaded is the subset
@@ -83,28 +127,249 @@ generate_world :: proc(world: ^World, seed: i64) {
 	}
 }
 
-// The Y the surface block's top sits at. Fractal noise: each octave doubles the
-// frequency and halves the contribution, which puts small bumps on large hills.
-terrain_height :: proc(seed: i64, x, z: int) -> int {
-	value, amplitude, frequency, normalizer: f32 = 0, 1, 1, 0
-	for octave in 0 ..< TERRAIN_OCTAVES {
-		p := noise.Vec2 {
-			f64(x) * f64(frequency) / TERRAIN_SCALE,
-			f64(z) * f64(frequency) / TERRAIN_SCALE,
+// One column after climate and relief. `height` is the Y the player stands at.
+// `layers` is how much soil sits under `top` before the stone.
+Column_Skin :: struct {
+	height: int,
+	biome:  Biome,
+	top:    Block,
+	soil:   Block,
+	layers: int,
+}
+
+SALT_WARP      :: 0x5000
+SALT_CONTINENT :: 0x5100
+SALT_TEMP      :: 0x5200
+SALT_LIFE      :: 0x5300
+SALT_RELIEF    :: 0x5400
+SALT_BEACH     :: 0x4000
+
+// Continent, temperature, and how much wants to grow. The warp is applied
+// before any of them, so a border wanders instead of following the lattice.
+// Height is not an input. The shape comes after this.
+climate :: proc(seed: i64, x, z: int) -> (continent, temperature, life: f32) {
+	p := noise.Vec2{f64(x) / 300, f64(z) / 300}
+	wx := noise.noise_2d(seed + SALT_WARP, p)
+	wz := noise.noise_2d(seed + SALT_WARP + 7, {p.y, p.x})
+	sx := f64(x) + f64(wx) * 70
+	sz := f64(z) + f64(wz) * 70
+	continent = noise.noise_2d(seed + SALT_CONTINENT, {sx / CLIMATE_SCALE, sz / CLIMATE_SCALE})
+	temperature = noise.noise_2d(seed + SALT_TEMP, {sx / 410, sz / 370})
+	life = noise.noise_2d(seed + SALT_LIFE, {sx / 360, sz / 430})
+	return
+}
+
+smooth01 :: proc(edge0, edge1, x: f32) -> f32 {
+	span := edge1 - edge0
+	if span == 0 {
+		return 1 if x >= edge1 else 0
+	}
+	t := clamp((x - edge0) / span, 0, 1)
+	return t * t * (3 - 2 * t)
+}
+
+// Weights sum to one. Ocean and beach are the low end of continental noise,
+// hills and mountains the high end, and the lowland that is left is split by
+// temperature and how barren it is. A column on a border keeps a share of
+// each side, which is what the height blend uses.
+biome_weights :: proc(seed: i64, x, z: int) -> (w: [Biome]f32) {
+	c, t, life := climate(seed, x, z)
+	// The lowland band sits on the fat part of the noise, so plains, forest,
+	// desert, and barrens are what you actually walk through. Hills and
+	// mountains are the high tail, and the sea is the low tail.
+	ocean := 1 - smooth01(-0.62, -0.38, c)
+	beach := smooth01(-0.62, -0.38, c) * (1 - smooth01(-0.38, -0.24, c))
+	inland := 1 - ocean - beach
+	if inland < 0 {
+		inland = 0
+	}
+	// Hills finish rising before mountains start, so the two bands do not
+	// overlap and the inland weights still sum to one.
+	mount_s := smooth01(0.72, 0.96, c)
+	hill_s := smooth01(0.42, 0.68, c)
+	low := inland * (1 - mount_s) * (1 - hill_s)
+	hot := smooth01(0.16, 0.48, t)
+	cold := 1 - smooth01(-0.50, -0.06, t)
+	barren_s := 1 - smooth01(-0.58, -0.10, life)
+	desert := low * hot
+	after := low - desert
+	barrens := after * barren_s
+	after -= barrens
+	forest := after * cold
+	plains := after - forest
+
+	w[.Ocean] = ocean
+	w[.Beach] = beach
+	w[.Mountains] = inland * mount_s
+	w[.Hills] = inland * (1 - mount_s) * hill_s
+	w[.Desert] = desert
+	w[.Barrens] = barrens
+	w[.Forest] = forest
+	w[.Plains] = plains
+
+	sum: f32
+	for biome in Biome {
+		if w[biome] < 0 {
+			w[biome] = 0
 		}
-		// A different seed per octave, so the octaves do not line up into ridges.
-		value += noise.noise_2d(seed + i64(octave), p) * amplitude
+		sum += w[biome]
+	}
+	if sum <= 0 {
+		w[.Plains] = 1
+		return
+	}
+	for biome in Biome {
+		w[biome] /= sum
+	}
+	return
+}
+
+// The heaviest weight. Plains wins a tie so a border stays a meadow when
+// nothing else is actually stronger.
+dominant_biome :: proc(w: [Biome]f32) -> Biome {
+	best := Biome.Plains
+	score := w[best]
+	for biome in Biome {
+		if w[biome] > score {
+			best = biome
+			score = w[biome]
+		}
+	}
+	return best
+}
+
+// This biome's height field, before it is mixed with its neighbors. Each
+// biome has its own seed, so a dune pattern does not show through a plains.
+biome_relief :: proc(seed: i64, x, z: int, biome: Biome) -> f32 {
+	shape := BIOME_SHAPE[biome]
+	value, amplitude, frequency, normalizer: f32 = 0, 1, 1, 0
+	for octave in 0 ..< shape.octaves {
+		p := noise.Vec2 {
+			f64(x) * f64(frequency) / f64(shape.scale),
+			f64(z) * f64(frequency) / f64(shape.scale),
+		}
+		n := noise.noise_2d(seed + SALT_RELIEF + i64(biome) * 0x1F + i64(octave), p)
+		sample: f32
+		switch shape.kind {
+		case .Rolling:
+			sample = n
+		case .Dunes:
+			sample = abs(n) * 2 - 1
+		case .Ridged:
+			sample = (1 - abs(n)) * 2 - 1
+		}
+		value += sample * amplitude
 		normalizer += amplitude
 		amplitude *= 0.5
 		frequency *= 2
 	}
-	// Clamped so terrain can never eat into the bedrock band.
-	return clamp(TERRAIN_BASE + int(value / normalizer * TERRAIN_AMPLITUDE), BEDROCK_DEPTH + 2, 120)
+	return shape.base + value / normalizer * shape.amplitude
 }
 
-// Fills one column from the bedrock floor up to `height`, which is the Y the player
-// stands at. Air is never written, so columns only allocate the chunks they occupy.
-generate_column :: proc(world: ^World, seed: i64, x, z: int, height: int) {
+// The Y the surface block's top sits at. Biome weights first, then a blend of
+// those biomes' relief, so a border slopes from one shape into the other.
+terrain_height :: proc(seed: i64, x, z: int) -> int {
+	return column_skin(seed, x, z).height
+}
+
+column_skin :: proc(seed: i64, x, z: int) -> (skin: Column_Skin) {
+	w := biome_weights(seed, x, z)
+	skin.biome = dominant_biome(w)
+	h: f32
+	for biome in Biome {
+		if w[biome] < 0.004 {
+			continue
+		}
+		h += w[biome] * biome_relief(seed, x, z, biome)
+	}
+	skin.height = clamp(int(math.floor(f64(h) + 0.5)), BEDROCK_DEPTH + 2, 160)
+	skin.top, skin.soil, skin.layers = column_cover(seed, x, z, skin.biome, skin.height)
+	return
+}
+
+// What the column is made of, once its biome and its height are both known.
+// Grass still refuses to grow under the sea. Everything else is the biome:
+// sand on a beach, dunes in a desert, stone on a high hill.
+column_cover :: proc(seed: i64, x, z: int, biome: Biome, height: int) -> (top, soil: Block, layers: int) {
+	switch biome {
+	case .Ocean:
+		if WATER_LEVEL - height < 6 {
+			return .Sand, .Sand, 3
+		}
+		return .Gravel, .Gravel, 2
+	case .Beach:
+		top = loose_cover(seed, x, z, false)
+		return top, top, 3
+	case .Desert:
+		top = loose_cover(seed, x, z, true)
+		soil = .Sand
+		layers = 4
+	case .Barrens:
+		if column_hash(seed, SALT_BEACH + 3, x, z) % 19 == 0 {
+			top = .Dirt
+			soil = .Dirt
+		} else {
+			top = .Gravel
+			soil = .Gravel
+		}
+		layers = 3
+	case .Hills:
+		if height >= 92 {
+			return .Stone, .Stone, 0
+		}
+		if height >= 84 {
+			return .Gravel, .Gravel, 2
+		}
+		top = .Grass
+		soil = .Dirt
+		layers = 3
+	case .Mountains:
+		if height >= 108 {
+			return .Stone, .Stone, 0
+		}
+		if height >= 92 {
+			return .Gravel, .Gravel, 2
+		}
+		top = .Grass
+		soil = .Dirt
+		layers = 2
+	case .Forest:
+		top = .Grass
+		soil = .Dirt
+		layers = 4
+	case .Plains:
+		top = .Grass
+		soil = .Dirt
+		layers = 3
+	}
+	if height < WATER_LEVEL && top == .Grass {
+		top = .Dirt
+	}
+	return
+}
+
+// Gravel in 4-block patches, plus a few loose stones. A desert biases the
+// patches so the dunes are not one unbroken sheet of sand.
+loose_cover :: proc(seed: i64, x, z: int, gravel_bias: bool) -> Block {
+	patch := column_hash(seed, SALT_BEACH, x >> 2, z >> 2)
+	cut: u64 = 1
+	if gravel_bias {
+		cut = 3
+	}
+	if patch % 5 < cut {
+		return .Gravel
+	}
+	if column_hash(seed, SALT_BEACH + 1, x, z) % 11 == 0 {
+		return .Gravel
+	}
+	return .Sand
+}
+
+// Fills one column from the bedrock floor up to the skin's height, which is
+// the Y the player stands at. Air is never written, so columns only allocate
+// the chunks they occupy.
+generate_column :: proc(world: ^World, seed: i64, x, z: int) {
+	skin := column_skin(seed, x, z)
 	write_gen_block(world, x, 0, z, .Bedrock)
 
 	// The jagged band: half of these come out bedrock, so the floor is uneven.
@@ -113,25 +378,69 @@ generate_column :: proc(world: ^World, seed: i64, x, z: int, height: int) {
 		write_gen_block(world, x, y, z, .Bedrock if jagged else .Stone)
 	}
 
-	grass_y := height - 1
-	dirt_y := grass_y - DIRT_DEPTH
+	top_y := skin.height - 1
+	soil_y := top_y - skin.layers
+	if soil_y < BEDROCK_DEPTH {
+		soil_y = BEDROCK_DEPTH
+	}
 
-	for y in BEDROCK_DEPTH ..< dirt_y {
+	for y in BEDROCK_DEPTH ..< soil_y {
 		write_gen_block(world, x, y, z, .Stone)
 	}
-	for y in max(dirt_y, BEDROCK_DEPTH) ..< grass_y {
-		write_gen_block(world, x, y, z, .Dirt)
+	for y in soil_y ..< top_y {
+		write_gen_block(world, x, y, z, skin.soil)
 	}
-	if grass_y >= BEDROCK_DEPTH {
-		// Grass does not grow underwater, so a flooded column is capped with dirt.
-		write_gen_block(world, x, grass_y, z, .Grass if height >= WATER_LEVEL else .Dirt)
+	if top_y >= BEDROCK_DEPTH {
+		write_gen_block(world, x, top_y, z, skin.top)
 	}
 
-	// A low column floods up to the water line, which is what puts lakes in the
-	// valleys the heightmap already produced.
-	for y in height ..< WATER_LEVEL {
+	// Low relief floods up to the water line. The biome already decided to be
+	// low; this only fills the air it left.
+	for y in skin.height ..< WATER_LEVEL {
 		write_gen_block(world, x, y, z, .Water)
 	}
+}
+
+// A meadow big enough to stand on. The search is coarse because a plains is
+// hundreds of blocks across; the first hit is then checked as a patch so the
+// player is not born on the rim of a desert.
+land_spawn :: proc(seed: i64) -> (x, z: int) {
+	if spawn_patch(seed, 0, 0) {
+		return 0, 0
+	}
+	for ring in 1 ..< 48 {
+		span := ring * 32
+		for i in -ring ..< ring {
+			if spawn_patch(seed, i * 32, -span) {
+				return i * 32, -span
+			}
+			if spawn_patch(seed, i * 32, span) {
+				return i * 32, span
+			}
+			if spawn_patch(seed, -span, i * 32) {
+				return -span, i * 32
+			}
+			if spawn_patch(seed, span, i * 32) {
+				return span, i * 32
+			}
+		}
+	}
+	return 0, 0
+}
+
+spawn_patch :: proc(seed: i64, x, z: int) -> bool {
+	for dz in -2 ..= 2 {
+		for dx in -2 ..= 2 {
+			skin := column_skin(seed, x + dx, z + dz)
+			if skin.biome != .Plains && skin.biome != .Forest {
+				return false
+			}
+			if skin.top != .Grass || skin.height < WATER_LEVEL + 2 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Veins are placed per cell of world rather than per column, which is what bounds how
@@ -180,10 +489,10 @@ place_vein :: proc(world: ^World, seed: i64, ore: Ore, cx, cz: int, index, attem
 	}
 }
 
-// At most one tree per cell, which is what guarantees a minimum spacing. A per-column
-// probability roll instead clumps trees together and gives no control over it.
-TREE_CELL    :: 8
-TREE_PERCENT :: 35 // Share of cells that get a tree.
+// At most one tree per cell outside a forest, which is what guarantees a
+// minimum spacing. A forest cell can hold a second trunk. A per-column roll
+// instead clumps trees together and gives no control over it.
+TREE_CELL :: 8
 
 TRUNK_MIN :: 4
 TRUNK_MAX :: 6
@@ -334,7 +643,7 @@ world_gen_ensure :: proc(gen: ^World_Gen, world: ^World, seed: i64, cx, cz: int)
 
 	for x in x0 ..< x0 + CHUNK_SIZE {
 		for z in z0 ..< z0 + CHUNK_SIZE {
-			generate_column(world, seed, x, z, terrain_height(seed, x, z))
+			generate_column(world, seed, x, z)
 		}
 	}
 	// Ore and trees land in this same pass, including the part of a neighbor's
@@ -362,8 +671,8 @@ world_gen_ores :: proc(world: ^World, seed: i64, cx, cz: int) {
 }
 
 // Canopies reach two blocks, so a trunk just outside this column can still
-// drop leaves here. Trunks on grass are decided from the heightmap when that
-// column is not generated yet, which is the same test generate_column uses.
+// drop leaves here. Whether the ground is grass comes from the biome when that
+// column is not generated yet, which is the same cover generate_column writes.
 world_gen_trees :: proc(gen: ^World_Gen, world: ^World, seed: i64, cx, cz: int) {
 	x0 := cx * CHUNK_SIZE
 	z0 := cz * CHUNK_SIZE
@@ -372,29 +681,64 @@ world_gen_trees :: proc(gen: ^World_Gen, world: ^World, seed: i64, cx, cz: int) 
 	for tcx in tree_cell(x0 - 2) ..= tree_cell(x1 + 2) {
 		for tcz in tree_cell(z0 - 2) ..= tree_cell(z1 + 2) {
 			h := column_hash(seed, SALT_TREE, tcx, tcz)
-			if h % 100 >= TREE_PERCENT {
-				continue
-			}
 			x := tcx * TREE_CELL + int((h >> 8) % TREE_CELL)
 			z := tcz * TREE_CELL + int((h >> 16) % TREE_CELL)
 			if x+2 < x0 || x-2 > x1 || z+2 < z0 || z-2 > z1 {
 				continue
 			}
-			if !tree_on_grass(gen, world, seed, x, z, cx, cz) {
+			skin := column_skin(seed, x, z)
+			if h % 100 >= tree_percent(skin.biome) {
+				continue
+			}
+			if !tree_on_grass(gen, world, x, z, cx, cz, skin) {
 				continue
 			}
 			trunk := TRUNK_MIN + int((h >> 24) % (TRUNK_MAX - TRUNK_MIN + 1))
-			place_oak(world, x, terrain_height(seed, x, z), z, trunk)
+			place_oak(world, x, skin.height, z, trunk)
+			if skin.biome != .Forest || (h >> 40) % 100 >= 60 {
+				continue
+			}
+			x2 := tcx * TREE_CELL + int((h >> 48) % TREE_CELL)
+			z2 := tcz * TREE_CELL + int((h >> 52) % TREE_CELL)
+			if x2 == x && z2 == z {
+				continue
+			}
+			if x2+2 < x0 || x2-2 > x1 || z2+2 < z0 || z2-2 > z1 {
+				continue
+			}
+			skin2 := column_skin(seed, x2, z2)
+			if !tree_on_grass(gen, world, x2, z2, cx, cz, skin2) {
+				continue
+			}
+			trunk2 := TRUNK_MIN + int((h >> 32) % (TRUNK_MAX - TRUNK_MIN + 1))
+			place_oak(world, x2, skin2.height, z2, trunk2)
 		}
 	}
 }
 
-tree_on_grass :: proc(gen: ^World_Gen, world: ^World, seed: i64, x, z, cx, cz: int) -> bool {
+// Share of tree cells that grow an oak. Sand, gravel, and the sea stay bare.
+tree_percent :: proc(biome: Biome) -> u64 {
+	switch biome {
+	case .Plains:
+		return 14
+	case .Forest:
+		return 85
+	case .Hills:
+		return 18
+	case .Mountains:
+		return 6
+	case .Ocean, .Beach, .Desert, .Barrens:
+		return 0
+	}
+	return 0
+}
+
+tree_on_grass :: proc(gen: ^World_Gen, world: ^World, x, z, cx, cz: int, skin: Column_Skin) -> bool {
 	origin := chunk_of(x, 0, z)
 	if (origin.x == cx && origin.z == cz) || column_done(gen, origin.x, origin.z) {
-		return get_block(world, x, terrain_height(seed, x, z)-1, z) == .Grass
+		return get_block(world, x, skin.height - 1, z) == .Grass
 	}
-	return terrain_height(seed, x, z) >= WATER_LEVEL
+	return skin.top == .Grass
 }
 
 column_done :: proc(gen: ^World_Gen, cx, cz: int) -> bool {
@@ -481,7 +825,7 @@ world_gen_schedule :: proc(world: ^World, cx, cz: int) {
 	keys: [dynamic][3]int
 	defer delete(keys)
 	for key, chunk in world.chunks {
-		if key.x != cx || key.z != cz || chunk.keep {
+		if key.x != cx || key.z != cz {
 			continue
 		}
 		append(&keys, key)
@@ -491,6 +835,9 @@ world_gen_schedule :: proc(world: ^World, cx, cz: int) {
 		if chunk == nil {
 			continue
 		}
+		// A restored chunk already had its grass and leaves considered. Its
+		// saplings still need a date, because those are not stored.
+		kept := chunk.keep
 		base := key * CHUNK_SIZE
 		for lx in 0 ..< CHUNK_SIZE {
 			for ly in 0 ..< CHUNK_SIZE {
@@ -501,9 +848,20 @@ world_gen_schedule :: proc(world: ^World, cx, cz: int) {
 					z := base.z + lz
 					#partial switch block {
 					case .Grass, .Dirt:
-						reschedule(world, x, y, z, world.time)
+						if !kept {
+							reschedule(world, x, y, z, world.time)
+						}
 					case .Oak_Leaves:
-						reconsider_leaf(world, x, y, z, world.time)
+						if !kept {
+							reconsider_leaf(world, x, y, z, world.time)
+						}
+					case .Oak_Sapling:
+						// Unloading keeps the date on the chunk. Scheduling again
+						// would start the wait over every time the player walked back.
+						i := deadline_index({lx, ly, lz})
+						if !kept || !deadline_waiting(chunk, i, .Sapling) {
+							reschedule(world, x, y, z, world.time)
+						}
 					}
 				}
 			}

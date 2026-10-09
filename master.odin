@@ -29,6 +29,11 @@ main :: proc() {
 	// 0 means no maximum. Raylib only limits the rate when asked to.
 	rl.SetTargetFPS(0)
 
+	audio := sound_init()
+	defer sound_destroy(&audio)
+	ears = &audio
+	defer ears = nil
+
 	display := Display{width = WINDOWED_WIDTH, height = WINDOWED_HEIGHT}
 
 	hud_font, owned := load_hud_font()
@@ -136,7 +141,11 @@ main :: proc() {
 		}
 
 		if front == .Title || front == .Worlds || front == .Create || front == .Join || front == .Server_Add {
-			switch menu_update(&menu, front) {
+			action := menu_update(&menu, front)
+			if action != .None {
+				sound_ui()
+			}
+			switch action {
 			case .None:
 			case .My_Worlds:
 				worlds_scan(&menu.cards)
@@ -235,25 +244,27 @@ main :: proc() {
 			local_world := client.server != nil
 			// The click that opens Settings is not also a click on a setting.
 			options_were_open := options.open
-			if rl.IsKeyPressed(.E) && !options.open && !paused {
+			if rl.IsKeyPressed(.E) && !options.open && !paused && !client.chat.open {
 				if client.inventory.open {
 					want_close = true
 				} else {
 					inventory_open_screen(&client.inventory)
 				}
 			}
-			if rl.IsKeyPressed(.O) && !client.inventory.open {
+			if rl.IsKeyPressed(.O) && !client.inventory.open && !client.chat.open {
 				options_toggle(&options)
 				// Pause keeps the cursor. Closing settings from there must not grab it.
 				if paused {
 					rl.EnableCursor()
 				}
 			}
-			if rl.IsKeyPressed(.V) && !paused {
+			if rl.IsKeyPressed(.V) && !paused && !client.chat.open {
 				client.third_person = !client.third_person
 			}
 			if rl.IsKeyPressed(.ESCAPE) {
-				if options.open {
+				if client.chat.open {
+					chat_close(&client.chat)
+				} else if options.open {
 					options_close(&options)
 					if paused {
 						rl.EnableCursor()
@@ -272,7 +283,11 @@ main :: proc() {
 				}
 			}
 			if paused && !options.open && front == .Playing {
-				#partial switch pause_click(&menu, local_world) {
+				action := pause_click(&menu, local_world)
+				if action != .None {
+					sound_ui()
+				}
+				#partial switch action {
 				case .Resume:
 					paused = false
 					options.suppress_look = true
@@ -317,7 +332,7 @@ main :: proc() {
 				// against it. The open has to land before the look, so this frame's
 				// cursor warp is thrown away with the other screens.
 				opened_table := false
-				if !options.open && !paused && !client.inventory.open && rl.IsMouseButtonPressed(.RIGHT) {
+				if !options.open && !paused && !client.inventory.open && !client.chat.open && rl.IsMouseButtonPressed(.RIGHT) {
 					eye := camera_from_player(client.player)
 					look := eye.target - eye.position
 					thit, tx, ty, tz, _, _, _ := raycast_block(&client.world, eye.position, look, MINE_REACH)
@@ -327,14 +342,28 @@ main :: proc() {
 						opened_table = true
 					}
 				}
-				playing = !options.open && !paused && !client.inventory.open
+				said: [CHAT_LINE]byte
+				said_n := chat_type(&client.chat, !options.open && !paused && !client.inventory.open, said[:])
+				playing = !options.open && !paused && !client.inventory.open && !client.chat.open
 				look_player(&client.player, playing && !options.suppress_look && !client.inventory.suppress_look)
 
 				frame_dt := f64(rl.GetFrameTime())
 				dt := min(f32(frame_dt), 0.05)
+				chat_tick(&client.chat, dt)
+				chat_welcome(&client.chat, client.id)
 				// The click that opened the table is not also a click inside it.
 				screen_open := client.inventory.open && !opened_table
-				input := client_read_input(client.player, playing, screen_open, client.inventory.table, client.inventory, &client.drag, &client.clicks, &client.place_delay, client.inventory.selected, dt)
+				input := client_read_input(client.player, playing, client.chat.open, screen_open, client.inventory.table, client.inventory, &client.drag, &client.clicks, &client.place_delay, client.inventory.selected, dt)
+				// A held click repeats a place. A door should swing once per press,
+				// or holding the button chatters it open and shut.
+				if input.use && !rl.IsMouseButtonPressed(.RIGHT) {
+					eye := camera_from_player(client.player)
+					look := eye.target - eye.position
+					dhit, dx, dy, dz, _, _, _ := raycast_block(&client.world, eye.position, look, MINE_REACH)
+					if dhit && block_is_door(get_block(&client.world, dx, dy, dz)) {
+						input.use = false
+					}
+				}
 				// A pause freezes the body. dt of zero skips gravity for this player
 				// without stopping the world, or anyone else who is still playing.
 				if paused {
@@ -355,6 +384,14 @@ main :: proc() {
 					input.action = .Stow
 					client.drag = {}
 					pending_close = true
+				}
+				if said_n > 0 {
+					n := said_n
+					if n > len(input.say) {
+						n = len(input.say)
+					}
+					copy(input.say[:n], said[:n])
+					input.say_n = n
 				}
 				if client.server != nil {
 					clear(&commands)
@@ -380,6 +417,9 @@ main :: proc() {
 				client.inventory.suppress_look = false
 				if front == .Playing {
 					advance_walk_cycles(&client, dt)
+					sound_bodies(&audio, &client.world, client.player, client.id, client.others[:], client.walks)
+					swing := client.mine.swing
+					digging := client.mine.on
 					// Mining stays on the eye ray. Third person only moves the view.
 					eye := camera_from_player(client.player)
 					camera = eye
@@ -390,6 +430,11 @@ main :: proc() {
 					}
 					look := eye.target - eye.position
 					hit, bx, by, bz, _, _, _ = raycast_block(&client.world, eye.position, look, MINE_REACH)
+					advance_mine(&client.mine, &client.world, equipped_item(&client.inventory), playing && input.attack, hit, bx, by, bz, dt)
+					// A wrap is one impact. The break itself arrives with the block edit.
+					if digging && client.mine.on && client.mine.swing < swing {
+						sound_strike(&audio, &client.world, client.mine.x, client.mine.y, client.mine.z)
+					}
 				}
 			}
 		}
@@ -397,19 +442,40 @@ main :: proc() {
 		// Start a new frame.
 		rl.BeginDrawing()
 		if front == .Playing {
-			// Fill the background with sky blue.
-			rl.ClearBackground(rl.SKYBLUE)
+			sky_time := client.sky_time
+			if client.server != nil {
+				sky_time = server.world.time
+			}
+			sky := sky_at(sky_time)
+			sky_color := sky_clear(sky)
+			rl.ClearBackground(sky_color)
 
-			// The world is jittered and accumulated when those options are on. The HUD
-			// stays on the backbuffer, after the resolve, so the crosshair and text
-			// are not blended across frames.
-			taa_begin(&taa, &msaa, camera, options.taa, options.msaa)
 			feet := client.player.position
 			focus := chunk_of(
 				block_index_horizontal(feet.x),
 				block_index_vertical(feet.y),
 				block_index_horizontal(feet.z),
 			)
+			// Build the meshes the shadow pass and the color pass both draw.
+			mesh_dirty(&renderer, &client.world, focus)
+			light_focus := feet + [3]f32{0, 1, 0}
+			light_vp, shadowed := render_shadows(&renderer, &client.world, &client, sky, light_focus)
+			use_shadow: f32 = 1 if shadowed else 0
+			light_bind(renderer.atlas_shader, renderer.atlas_light, sky, light_vp, 1, use_shadow)
+			light_bind(renderer.cutout, renderer.cutout_light, sky, light_vp, 1, use_shadow)
+			light_bind(renderer.mesh_shader, renderer.mesh_light, sky, light_vp, 1, use_shadow)
+			light_bind(renderer.water_shader, renderer.water_light, sky, light_vp, 1, use_shadow)
+
+			// The world is jittered and accumulated when those options are on. The HUD
+			// stays on the backbuffer, after the resolve, so the crosshair and text
+			// are not blended across frames.
+			taa_begin(&taa, &msaa, camera, options.taa, options.msaa, sky_color)
+			if shadowed {
+				// After the scene target is bound. An earlier bind is dropped when
+				// that target is attached.
+				bind_shadow_texture(&renderer)
+			}
+			draw_sky(camera, sky, renderer.stars[:], renderer.star_dot, sky_lst(sky_time))
 			draw_world(&renderer, &client.world, camera, focus, client.retired[:])
 			clear(&client.retired)
 			draw_table_items(&renderer, &client.world, client.tables)
@@ -419,21 +485,36 @@ main :: proc() {
 			if show_self {
 				draw_local_player(&renderer, &client)
 			}
-			draw_water(&renderer)
+			if client.mine.on && client.mine.time > 0 {
+				block := get_block(&client.world, client.mine.x, client.mine.y, client.mine.z)
+				need := mine_seconds(block, client.mine.tool)
+				stage := int(client.mine.time / need * f32(BREAK_STAGES))
+				if stage >= BREAK_STAGES {
+					stage = BREAK_STAGES - 1
+				}
+				draw_break_cracks(&renderer, client.mine.x, client.mine.y, client.mine.z, stage, block)
+			}
+			draw_water(&renderer, f32(sky_time))
 			draw_drops(&renderer, client.drops[:], .Translucent)
 			if playing && hit {
-				draw_block_highlight(bx, by, bz, camera.position)
+				draw_block_highlight(bx, by, bz, camera.position, get_block(&client.world, bx, by, bz))
 			}
 			taa_resolve(&taa, &msaa)
 
 			// After the resolve, so clearing depth cannot wipe the buffer the
 			// temporal pass just read. Third person already draws the body.
 			if !client.third_person {
-				draw_viewmodel(&renderer, camera, equipped_item(&client.inventory))
+				// The viewmodel is drawn in view space. Rotate the light into
+				// that space so night darkens the hand and the sun still shades it.
+				light_viewmodel(&renderer, camera, sky)
+				draw_viewmodel(&renderer, camera, equipped_item(&client.inventory), client.mine.swing)
 			}
 
 			if playing {
 				draw_crosshair()
+			}
+			if !options.open && !paused && !client.inventory.open {
+				draw_nameplates(hud_font, camera, client.others[:])
 			}
 			draw_fps(hud_font, 8, 8)
 			draw_frame_time(hud_font, 8, 30)
@@ -447,7 +528,16 @@ main :: proc() {
 			}
 			draw_player_position(hud_font, client.player)
 			draw_player_direction(hud_font, client.player)
-			draw_inventory(hud_font, &renderer, client.inventory, client.drag)
+			// The viewmodel bind left the sun in view space. The portrait is a
+			// world-space model, so put the daylight direction back first.
+			if !client.third_person {
+				light_bind(renderer.cutout, renderer.cutout_light, sky, light_vp, 1, 0)
+				light_bind(renderer.mesh_shader, renderer.mesh_light, sky, light_vp, 1, 0)
+			}
+			draw_inventory(hud_font, &renderer, client.inventory, client.drag, client.player, client.walks[client.id])
+			if !client.inventory.open && !options.open {
+				draw_chat(hud_font, &client.chat)
+			}
 			if paused && !options.open {
 				draw_pause(hud_font, &menu, client.server != nil, server.host.listening)
 			}
@@ -464,6 +554,8 @@ main :: proc() {
 		// Sampled here because EndDrawing is where raylib waits out the frame limiter,
 		// and that wait is exactly what this measurement has to exclude.
 		work_seconds = rl.GetTime() - frame_start
+
+		sound_mix(&audio)
 
 		// Finish the frame and show it.
 		rl.EndDrawing()

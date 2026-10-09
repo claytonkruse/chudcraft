@@ -1,3 +1,5 @@
 *.exe
 worlds/
 servers.chud
+# Development stand-ins from a local Minecraft install. Not part of the game that ships.
+assets/sounds/

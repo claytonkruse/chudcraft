@@ -37,6 +37,9 @@ Client_Input :: struct {
 	table_x, table_y, table_z: int,
 	// Chunks this client keeps loaded. The options screen sets it.
 	render_distance: int,
+	// A chat line or a command, sent the frame Enter was pressed. Empty otherwise.
+	say_n:           int,
+	say:             [CHAT_LINE]byte,
 }
 
 Player_Command :: struct {
@@ -53,6 +56,10 @@ Remote_View :: struct {
 	position:         [3]f32,
 	yaw, pitch:       f32,
 	phase, amount:    f32,
+	// Torso yaw. The head uses yaw, and this lags behind it.
+	body:             f32,
+	// The hotbar stack in this player's hand.
+	held:             Item,
 }
 
 // Remembers a remote player's stride between draws. The view itself is rebuilt
@@ -60,6 +67,8 @@ Remote_View :: struct {
 Walk_Cycle :: struct {
 	phase, amount: f32,
 	x, z:          f32,
+	// Torso yaw. The look yaw is the head, and this follows a step later.
+	body:          f32,
 	has:           bool,
 }
 
@@ -72,6 +81,9 @@ Server_Player :: struct {
 	table_at:   [3]int,
 	// Chunks kept loaded around this player. Set from their options screen.
 	render_distance: int,
+	// The block this player is currently digging. Not sent; the client animates
+	// its own copy from the same hold.
+	mine: Mine,
 }
 
 Server :: struct {
@@ -88,6 +100,8 @@ Server :: struct {
 	drop_rng: u64,
 	// Present only while this process is hosting. Solo play leaves it empty.
 	host:    Host_Link,
+	// Lines produced this step. Cleared with the block edits, then copied out.
+	notes:   [dynamic]Chat_Note,
 	// Columns still waiting. The spawn column is filled before anyone joins.
 	gen:     World_Gen,
 }
@@ -100,7 +114,9 @@ server_start :: proc(seed: i64) -> Server {
 	// The column under spawn, so the first frame has ground to stand on.
 	// Everyone is born in this column; a later id that walks out of it is filled
 	// in server_join. The rest of the render distance follows one column a frame.
-	world_gen_ensure(&server.gen, &server.world, seed, 0, 0)
+	server.world.spawn_x, server.world.spawn_z = land_spawn(seed)
+	born := chunk_of(server.world.spawn_x, 0, server.world.spawn_z)
+	world_gen_ensure(&server.gen, &server.world, seed, born.x, born.z)
 	server.world.record = true
 	return server
 }
@@ -114,6 +130,7 @@ server_destroy :: proc(server: ^Server) {
 	delete(server.foci)
 	delete(server.drops)
 	delete(server.tables)
+	delete(server.notes)
 	world_gen_destroy(&server.gen)
 	world_destroy(&server.world)
 }
@@ -121,10 +138,11 @@ server_destroy :: proc(server: ^Server) {
 server_join :: proc(server: ^Server, render_distance: int) -> u32 {
 	server.next_id += 1
 	// A step apart, so two people are not born inside one body.
-	x := SPAWN_X + int(server.next_id-1)*2
+	x := server.world.spawn_x + int(server.next_id-1)*2
+	z := server.world.spawn_z
 	// The column has to exist before the feet are planted on it. Play is already
 	// recording, so this write is a chunk copy rather than one change per block.
-	born := chunk_of(x, 0, SPAWN_Z)
+	born := chunk_of(x, 0, z)
 	record := server.world.record
 	server.world.record = false
 	server.world.syncing = record
@@ -134,7 +152,7 @@ server_join :: proc(server: ^Server, render_distance: int) -> u32 {
 	player := new(Server_Player)
 	player.render_distance = render_radius(render_distance)
 	player.player = {
-		position = {f32(x), f32(surface_height(&server.world, x, SPAWN_Z)), f32(SPAWN_Z)},
+		position = {f32(x), f32(surface_height(&server.world, x, z)), f32(z)},
 		grounded = true,
 	}
 	server.players[server.next_id] = player
@@ -154,6 +172,7 @@ server_leave :: proc(server: ^Server, id: u32) {
 // the world until the next step so each client can copy them.
 server_step :: proc(server: ^Server, commands: []Player_Command, frame_dt: f64) -> Grow_Report {
 	clear(&server.world.changes)
+	clear(&server.notes)
 	for command in commands {
 		server_apply(server, command.id, command.input)
 	}
@@ -173,7 +192,7 @@ server_step :: proc(server: ^Server, commands: []Player_Command, frame_dt: f64) 
 	}
 	world_gen_advance(&server.gen, &server.world, server.seed, spots[:n], true)
 	drops_advance(&server.drops, &server.world, server.players, f32(frame_dt))
-	return grow_advance(&server.world, server.foci[:], frame_dt)
+	return grow_advance(&server.world, server.foci[:], frame_dt, &server.drops, &server.drop_rng)
 }
 
 // After a load: drop columns the players are not near, remember which columns
@@ -214,11 +233,17 @@ server_apply :: proc(server: ^Server, id: u32, input: Client_Input) {
 	player.render_distance = render_radius(input.render_distance)
 	simulate_player(&player.player, &server.world, input.move)
 	server_inventory(server, player, input)
-	if input.attack {
-		server_attack(server, player)
-	}
+	server_mine(server, player, input)
 	if input.use {
 		server_use(server, player)
+	}
+	n := input.say_n
+	if n > len(input.say) {
+		n = len(input.say)
+	}
+	if n > 0 {
+		said := input.say
+		server_say(server, id, string(said[:n]))
 	}
 }
 
@@ -403,28 +428,53 @@ server_empty_grid :: proc(server: ^Server, player: ^Server_Player, grid: []Slot)
 	}
 }
 
-server_attack :: proc(server: ^Server, player: ^Server_Player) {
+server_mine :: proc(server: ^Server, player: ^Server_Player, input: Client_Input) {
 	hit, x, y, z, _, _, _ := server_ray(server, player)
-	if !hit {
+	tool := equipped_item(&player.inventory)
+	advance_mine(&player.mine, &server.world, tool, input.attack, hit, x, y, z, input.move.dt)
+	if !player.mine.on || player.mine.time < mine_seconds(get_block(&server.world, x, y, z), tool) {
 		return
 	}
 	broken := get_block(&server.world, x, y, z)
-	if !breakable(broken) {
-		return
-	}
+	player.mine = {}
 	if broken == .Workbench {
 		server_spill_table(server, x, y, z)
 	}
+	// A door standing on this block falls with it. Remembered before the write,
+	// because the settle that follows the break is what takes the door down.
+	stood := door_is_lower(get_block(&server.world, x, y+1, z))
+	// hear marks this edit so clients play it. The spill above is items, not a break.
+	server.world.hear = true
+	if block_is_door(broken) {
+		door_remove(&server.world, x, y, z)
+		server.world.hear = false
+		drop_spawn(&server.drops, &server.drop_rng, item_block(.Oak_Door), 1, x, y, z)
+		return
+	}
 	set_block(&server.world, x, y, z, .Air)
-	drop_spawn(&server.drops, &server.drop_rng, item_block(broken), 1, x, y, z)
+	server.world.hear = false
+	drop_spawn(&server.drops, &server.drop_rng, block_drop(broken), 1, x, y, z)
+	if stood && !block_is_door(get_block(&server.world, x, y+1, z)) {
+		drop_spawn(&server.drops, &server.drop_rng, item_block(.Oak_Door), 1, x, y+1, z)
+	}
 }
 
 server_use :: proc(server: ^Server, player: ^Server_Player) {
-	hit, _, _, _, px, py, pz := server_ray(server, player)
+	hit, x, y, z, px, py, pz := server_ray(server, player)
 	if !hit {
 		return
 	}
+	// Looking at a door swings it. Holding another block does not place through
+	// the panel; the empty part of an open door is not a hit, so that still places.
+	if block_is_door(get_block(&server.world, x, y, z)) {
+		server.world.hear = true
+		door_toggle(&server.world, x, y, z)
+		server.world.hear = false
+		return
+	}
+	server.world.hear = true
 	inventory_place(&player.inventory, player.player, &server.world, px, py, pz)
+	server.world.hear = false
 }
 
 server_ray :: proc(server: ^Server, player: ^Server_Player) -> (hit: bool, x, y, z, px, py, pz: int) {

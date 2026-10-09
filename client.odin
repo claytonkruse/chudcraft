@@ -22,12 +22,19 @@ Client :: struct {
 	drag:      Drag,
 	// Seconds left before a held right click may place again. Zero places now.
 	place_delay: f32,
+	// This window's dig, for the crack and the arm. The server breaks the block.
+	mine: Mine,
+	// The host's world clock, copied from the state packet. The host itself
+	// reads the server clock directly.
+	sky_time: f64,
 	// The previous left click, so a second one on the same slot can gather.
 	clicks:    Click_Memory,
 	// Ingredients on placed workbenches, copied from the server each step.
 	tables:    map[[3]int][CRAFT3_N]Slot,
 	// The block whose 3x3 this window is editing. Meaningful while inventory.table.
 	table_at:  [3]int,
+	// This window's chat. The lines are copies of what the server said this step.
+	chat:      Chat,
 	// Chunks dropped since the last draw. The renderer frees those meshes and
 	// does not scan the rest.
 	retired:    [dynamic][3]int,
@@ -83,6 +90,7 @@ client_destroy :: proc(client: ^Client) {
 	delete(client.tables)
 	delete(client.retired)
 	delete(client.drop_keys)
+	delete(client.chat.lines)
 	world_destroy(&client.world)
 	client.server = nil
 	client.id = 0
@@ -111,8 +119,11 @@ client_pull :: proc(client: ^Client, render_distance: int) {
 		}
 		apply_open_table(client)
 	}
+	sound_listen(client.player)
 	for change in client.server.world.changes {
+		old := get_block(&client.world, change.x, change.y, change.z)
 		store_block(&client.world, change.x, change.y, change.z, change.block)
+		sound_changed(&client.world, change.x, change.y, change.z, old, change.block, change.audible)
 	}
 	// Columns generated this step, copied from the server after the edits so a
 	// chunk that was both mined and generated keeps the server's end state.
@@ -152,8 +163,10 @@ client_pull :: proc(client: ^Client, render_distance: int) {
 			position = other.player.position,
 			yaw = other.player.yaw,
 			pitch = other.player.pitch,
+			held = equipped_item(&other.inventory),
 		})
 	}
+	take_chat(&client.chat, client.server, client.id)
 }
 
 // Forgets chunks past the unload margin. The server sends a column again when
@@ -207,25 +220,29 @@ apply_open_table :: proc(client: ^Client) {
 PLACE_REPEAT :: 0.2
 
 // Keys and mouse become a message. Nothing here changes the world.
-client_read_input :: proc(player: Player, playing, inventory_open, table: bool, inv: Inventory, drag: ^Drag, clicks: ^Click_Memory, place_delay: ^f32, selected: int, move_dt: f32) -> Client_Input {
+client_read_input :: proc(player: Player, playing, typing, inventory_open, table: bool, inv: Inventory, drag: ^Drag, clicks: ^Click_Memory, place_delay: ^f32, selected: int, move_dt: f32) -> Client_Input {
 	input := Client_Input{
 		move = {
 			dt = move_dt,
 			yaw = player.yaw,
 			pitch = player.pitch,
-			forward = rl.IsKeyDown(.W),
-			back = rl.IsKeyDown(.S),
-			left = rl.IsKeyDown(.A),
-			right = rl.IsKeyDown(.D),
-			jump = rl.IsKeyDown(.SPACE),
 		},
 	}
+	// W is a letter while a line is being typed, so the body stays put.
+	if typing {
+		return input
+	}
+	input.move.forward = rl.IsKeyDown(.W)
+	input.move.back = rl.IsKeyDown(.S)
+	input.move.left = rl.IsKeyDown(.A)
+	input.move.right = rl.IsKeyDown(.D)
+	input.move.jump = rl.IsKeyDown(.SPACE)
 	if !inventory_open {
 		drag^ = {}
 		clicks^ = {}
 	}
 	if playing {
-		input.attack = rl.IsMouseButtonPressed(.LEFT)
+		input.attack = rl.IsMouseButtonDown(.LEFT)
 		if rl.IsMouseButtonDown(.RIGHT) {
 			if place_delay^ > 0 {
 				place_delay^ -= move_dt

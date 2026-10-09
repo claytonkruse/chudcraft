@@ -19,6 +19,8 @@ Everything is one `package main`, split by concern:
 | `gen.odin` | World generation. Writes only through `set_block`. No raylib |
 | `mesh.odin` | Everything GPU: textures, materials, chunk meshes, face culling, draw passes |
 | `player.odin` | Movement, collision, and the camera |
+| `chat.odin` | The chat line, slash commands, and the names above other players |
+| `sound.odin` | The ray-traced mixer: recordings, echoes, and the one pair of ears |
 | `dpi_windows.odin`, `dpi_other.odin` | Per-platform DPI awareness, which must be claimed before the window exists |
 
 `world.odin` and `gen.odin` deliberately do not import raylib. Keep it that way, so
@@ -118,3 +120,42 @@ finishing. `git status --short` should show only intended changes.
 - **Platform-specific code needs a file suffix or a `#+build` tag;** `import` cannot go
   inside a `when`. Do not import `core:sys/windows` here, since it links `user32.lib`
   whose `CloseWindow` collides with raylib's.
+
+## Sound
+
+`sound.odin` traces sound the same way the break ray walks blocks. One block is a meter,
+and the speed is the real 343 m/s, so a nearby wall is a slap and a ravine is an echo.
+The grid shift is the same half-block on X and Z as `raycast_block`. A ray that had to
+land in the ear on its own would miss, and a footstep would flicker, so each path is two
+rays: one walks the bounces (`SOUND_RAYS`, `SOUND_BOUNCES`), and from each hit a second
+ray asks whether the ear can see that point. The direct path is that visibility ray from
+the source. The ground under a footstep is the direct path again, so a bounce closer
+than about a block to the source is not connected. Arrivals a few milliseconds apart are
+folded into one voice, or two copies of the same step comb-filter.
+
+Leaves stop the player and still let a ray through, thinned. `sound_blocks` is
+`block_solid` except oak leaves. Water can throw a bounce back. The mixer is one stereo
+stream. Delay is samples of travel time, and pan is equal-power from the arrival
+direction. `ears` is this window's listener. Menus are not a place in the world, so
+`sound_ui` plays the click dry.
+
+What gets heard:
+
+- Footsteps, from the walk cycle crossing a plant, on the block under the feet. Wading
+  uses the wet-grass steps. Entering water is a splash.
+- A jump, a small fall, and a big fall once the drop is past about three blocks.
+- A mining tick, which is the step recording played quieter. The break is its own clip.
+- A break or a place, only when `World.hear` was set around that one `set_block`. Growth,
+  decay, and a tree filling in use the same write path and must stay silent. `hear` is
+  set in `server_mine` and `server_use`.
+- The audible bit rides on `Block_Change` and is one extra byte after the block id on
+  the wire. Dropping it desynchronizes every later field in the state packet.
+
+The recordings in `assets/sounds/` were copied out of a local Minecraft install (Prism
+Launcher, asset index 34) for development. They are gitignored and are not part of the
+game that ships. Replace that directory before distributing. A missing file falls back
+to `synthesize`, which is also all a jump has, because Minecraft has no jump recording.
+Dirt uses the rooted-dirt takes, leaves use the azalea-leaf takes, and placing a block
+plays the same takes as breaking it. Each play picks one variant so a step is not the
+same hit twice. Do not commit the oggs, and do not point the engine back at the Prism
+folder. There is no license check; the files are already on disk for this checkout.
